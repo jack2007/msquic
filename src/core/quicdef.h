@@ -368,7 +368,7 @@ CXPLAT_STATIC_ASSERT(
 // The max ideal send buffer size (in bytes). Note that this is not
 // a hard max on the number of bytes buffered for the connection.
 //
-#define QUIC_MAX_IDEAL_SEND_BUFFER_SIZE         0x8000000 // 134217728
+#define QUIC_MAX_IDEAL_SEND_BUFFER_SIZE         0x40000000 // 1073741824
 
 //
 // The minimum number of bytes of send allowance we must have before we will
