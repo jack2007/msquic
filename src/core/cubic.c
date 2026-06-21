@@ -691,7 +691,7 @@ Exit:
 
     if (Connection->Settings.NetStatsEventEnabled) {
         const QUIC_PATH* Path = &Connection->Paths[0];
-        QUIC_CONNECTION_EVENT Event;
+        QUIC_CONNECTION_EVENT Event = {0};
         Event.Type = QUIC_CONNECTION_EVENT_NETWORK_STATISTICS;
         Event.NETWORK_STATISTICS.BytesInFlight = Cubic->BytesInFlight;
         Event.NETWORK_STATISTICS.PostedBytes = Connection->SendBuffer.PostedBytes;

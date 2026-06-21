@@ -196,7 +196,7 @@ typedef struct QUIC_RX_PACKET QUIC_RX_PACKET;
 // FLUSH_SEND operation. The actual number will generally exceed this value up
 // to the limit of the current USO buffer being filled.
 //
-#define QUIC_MAX_DATAGRAMS_PER_SEND             40
+#define QUIC_MAX_DATAGRAMS_PER_SEND             240
 
 //
 // The number of packets we write for a single stream before going to the next
@@ -368,7 +368,7 @@ CXPLAT_STATIC_ASSERT(
 // The max ideal send buffer size (in bytes). Note that this is not
 // a hard max on the number of bytes buffered for the connection.
 //
-#define QUIC_MAX_IDEAL_SEND_BUFFER_SIZE         0x40000000 // 1073741824
+#define QUIC_MAX_IDEAL_SEND_BUFFER_SIZE         0x80000000 // 2147483648
 
 //
 // The minimum number of bytes of send allowance we must have before we will

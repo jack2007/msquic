@@ -316,6 +316,26 @@ BbrCongestionControlGetNetworkStatistics(
     NetworkStatistics->SmoothedRTT = Path->SmoothedRtt;
     NetworkStatistics->CongestionWindow = BbrCongestionControlGetCongestionWindow(Cc);
     NetworkStatistics->Bandwidth = BbrCongestionControlGetBandwidth(Cc) / BW_UNIT;
+    NetworkStatistics->BytesInFlightMax = Bbr->BytesInFlightMax;
+    NetworkStatistics->BbrState = Bbr->BbrState;
+    NetworkStatistics->BbrRecoveryState = Bbr->RecoveryState;
+    NetworkStatistics->BbrRecoveryWindow = Bbr->RecoveryWindow;
+    NetworkStatistics->BbrPacingGain = Bbr->PacingGain;
+    NetworkStatistics->BbrCwndGain = Bbr->CwndGain;
+    NetworkStatistics->BbrMinRtt = Bbr->MinRtt;
+    NetworkStatistics->BbrSendQuantum = Bbr->SendQuantum;
+    NetworkStatistics->BbrAppLimited = BbrCongestionControlIsAppLimited(Cc);
+    NetworkStatistics->SendFlushCount = Connection->Stats.SendDiag.FlushCount;
+    NetworkStatistics->SendFlushPacingDelayedCount = Connection->Stats.SendDiag.FlushPacingDelayedCount;
+    NetworkStatistics->SendFlushCcBlockedCount = Connection->Stats.SendDiag.FlushCcBlockedCount;
+    NetworkStatistics->SendFlushSchedulingCount = Connection->Stats.SendDiag.FlushSchedulingCount;
+    NetworkStatistics->SendFlushAmplificationBlockedCount = Connection->Stats.SendDiag.FlushAmplificationBlockedCount;
+    NetworkStatistics->SendFlushNoWorkCount = Connection->Stats.SendDiag.FlushNoWorkCount;
+    NetworkStatistics->SendFlushLastAllowance = Connection->Stats.SendDiag.LastFlushAllowance;
+    NetworkStatistics->SendFlushLastPathAllowance = Connection->Stats.SendDiag.LastFlushPathAllowance;
+    NetworkStatistics->SendFlushLastResult = Connection->Stats.SendDiag.LastFlushResult;
+    NetworkStatistics->SendFlushLastDatagrams = Connection->Stats.SendDiag.LastFlushDatagrams;
+    NetworkStatistics->OutFlowBlockedReasons = Connection->Stats.SendDiag.LastOutFlowBlockedReasons;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -333,13 +353,17 @@ BbrCongestionControlIndicateConnectionEvent(
     QuicTraceLogConnVerbose(
         IndicateDataAcked,
         Connection,
-        "Indicating QUIC_CONNECTION_EVENT_NETWORK_STATISTICS [BytesInFlight=%u,PostedBytes=%llu,IdealBytes=%llu,SmoothedRTT=%llu,CongestionWindow=%u,Bandwidth=%llu]",
+        "Indicating QUIC_CONNECTION_EVENT_NETWORK_STATISTICS [BytesInFlight=%u,PostedBytes=%llu,IdealBytes=%llu,SmoothedRTT=%llu,CongestionWindow=%u,Bandwidth=%llu,BytesInFlightMax=%u,BbrState=%u,BbrRecoveryState=%u,BbrRecoveryWindow=%u]",
         Event.NETWORK_STATISTICS.BytesInFlight,
         Event.NETWORK_STATISTICS.PostedBytes,
         Event.NETWORK_STATISTICS.IdealBytes,
         Event.NETWORK_STATISTICS.SmoothedRTT,
         Event.NETWORK_STATISTICS.CongestionWindow,
-        Event.NETWORK_STATISTICS.Bandwidth);
+        Event.NETWORK_STATISTICS.Bandwidth,
+        Event.NETWORK_STATISTICS.BytesInFlightMax,
+        Event.NETWORK_STATISTICS.BbrState,
+        Event.NETWORK_STATISTICS.BbrRecoveryState,
+        Event.NETWORK_STATISTICS.BbrRecoveryWindow);
     QuicConnIndicateEvent(Connection, &Event);
 }
 

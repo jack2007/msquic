@@ -1310,6 +1310,9 @@ QuicSendFlush(
 #endif
 
     QUIC_SEND_RESULT Result = QUIC_SEND_INCOMPLETE;
+    BOOLEAN DiagAmplificationBlocked = FALSE;
+    BOOLEAN DiagCcBlocked = FALSE;
+    BOOLEAN DiagNoWork = FALSE;
     QUIC_STREAM* Stream = NULL;
     uint32_t StreamPacketCount = 0;
     do {
@@ -1320,6 +1323,7 @@ QuicSendFlush(
                 Connection,
                 "Cannot send any more because of amplification protection");
             Result = QUIC_SEND_COMPLETE;
+            DiagAmplificationBlocked = TRUE;
             break;
         }
 
@@ -1359,6 +1363,7 @@ QuicSendFlush(
                     // No pure ACKs to send right now. All done sending for now.
                     //
                     Result = QUIC_SEND_COMPLETE;
+                    DiagCcBlocked = TRUE;
                 }
                 break;
             }
@@ -1452,6 +1457,7 @@ QuicSendFlush(
             // Nothing else left to send right now.
             //
             Result = QUIC_SEND_COMPLETE;
+            DiagNoWork = TRUE;
             break;
         }
 
@@ -1491,6 +1497,9 @@ QuicSendFlush(
         CXPLAT_DBG_ASSERT(Builder.SendData == NULL);
     }
 
+    const uint32_t DiagLastAllowance = Builder.SendAllowance;
+    const uint32_t DiagLastPathAllowance = Path->Allowance;
+    const uint32_t DiagLastDatagrams = Builder.TotalCountDatagrams;
     QuicPacketBuilderCleanup(&Builder);
 
     QuicTraceLogConnVerbose(
@@ -1530,6 +1539,28 @@ QuicSendFlush(
         // Temporarily disabled for now.
         //QuicConnUpdatePeerPacketTolerance(Connection, Builder.TotalCountDatagrams);
     }
+
+    Connection->Stats.SendDiag.FlushCount++;
+    if (Result == QUIC_SEND_DELAYED_PACING) {
+        Connection->Stats.SendDiag.FlushPacingDelayedCount++;
+    }
+    if (DiagCcBlocked) {
+        Connection->Stats.SendDiag.FlushCcBlockedCount++;
+    }
+    if (Result == QUIC_SEND_INCOMPLETE) {
+        Connection->Stats.SendDiag.FlushSchedulingCount++;
+    }
+    if (DiagAmplificationBlocked) {
+        Connection->Stats.SendDiag.FlushAmplificationBlockedCount++;
+    }
+    if (DiagNoWork) {
+        Connection->Stats.SendDiag.FlushNoWorkCount++;
+    }
+    Connection->Stats.SendDiag.LastFlushAllowance = DiagLastAllowance;
+    Connection->Stats.SendDiag.LastFlushPathAllowance = DiagLastPathAllowance;
+    Connection->Stats.SendDiag.LastFlushResult = Result;
+    Connection->Stats.SendDiag.LastFlushDatagrams = DiagLastDatagrams;
+    Connection->Stats.SendDiag.LastOutFlowBlockedReasons = Connection->OutFlowBlockedReasons;
 
     //
     // Clears the SendQueue list of not sent packets if the flag is applied

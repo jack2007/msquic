@@ -666,6 +666,26 @@ typedef struct QUIC_NETWORK_STATISTICS
     uint64_t SmoothedRTT;                // Smoothed RTT value
     uint32_t CongestionWindow;           // Congestion Window
     uint64_t Bandwidth;                  // Estimated bandwidth
+    uint32_t BytesInFlightMax;           // Maximum observed bytes in flight
+    uint32_t BbrState;                   // BBR state machine state
+    uint32_t BbrRecoveryState;           // BBR recovery state
+    uint32_t BbrRecoveryWindow;          // BBR recovery window
+    uint32_t BbrPacingGain;              // BBR pacing gain
+    uint32_t BbrCwndGain;                // BBR cwnd gain
+    uint64_t BbrMinRtt;                  // BBR minimum RTT estimate
+    uint64_t BbrSendQuantum;             // BBR send quantum
+    BOOLEAN BbrAppLimited;               // TRUE if BBR bandwidth sample is app-limited
+    uint64_t SendFlushCount;             // Send flush calls that reached packet builder
+    uint64_t SendFlushPacingDelayedCount;// Send flushes delayed by pacing
+    uint64_t SendFlushCcBlockedCount;    // Send flushes blocked by congestion control
+    uint64_t SendFlushSchedulingCount;   // Send flushes limited by scheduling
+    uint64_t SendFlushAmplificationBlockedCount; // Send flushes blocked by anti-amplification
+    uint64_t SendFlushNoWorkCount;       // Send flushes with no frames/streams ready
+    uint32_t SendFlushLastAllowance;     // Last packet builder send allowance
+    uint32_t SendFlushLastPathAllowance; // Last path anti-amplification allowance
+    uint32_t SendFlushLastResult;        // Last send flush result enum value
+    uint32_t SendFlushLastDatagrams;     // Last send flush datagram count
+    uint32_t OutFlowBlockedReasons;      // Last connection out-flow blocked reason bitmask
 
 } QUIC_NETWORK_STATISTICS;
 
