@@ -989,6 +989,7 @@ QuicLossDetectionDetectAndHandleLostPackets(
                         QuicPacketTraceType(Packet),
                         QUIC_TRACE_PACKET_LOSS_FACK);
                 }
+                Connection->Stats.SendDiag.LossDetectionFackPacketCount++;
             } else if (Packet->PacketNumber < LossDetection->LargestAck &&
                         CxPlatTimeAtOrBefore64(Packet->SentTime + TimeReorderThreshold, TimeNow)) {
                 if (!NonretransmittableHandshakePacket) {
@@ -1006,6 +1007,7 @@ QuicLossDetectionDetectAndHandleLostPackets(
                         QuicPacketTraceType(Packet),
                         QUIC_TRACE_PACKET_LOSS_RACK);
                 }
+                Connection->Stats.SendDiag.LossDetectionRackPacketCount++;
             } else {
                 break;
             }
@@ -1041,6 +1043,9 @@ QuicLossDetectionDetectAndHandleLostPackets(
         QuicLossValidate(LossDetection);
 
         if (LostRetransmittableBytes > 0) {
+            Connection->Stats.SendDiag.LossDetectionEventCount++;
+            Connection->Stats.SendDiag.LostRetransmittableBytes += LostRetransmittableBytes;
+            Connection->Stats.SendDiag.LastLostRetransmittableBytes = LostRetransmittableBytes;
             if (LossDetection->ProbeCount > QUIC_PERSISTENT_CONGESTION_THRESHOLD) {
                 //
                 // On persistent congestion, reset the peer's packet tolerance

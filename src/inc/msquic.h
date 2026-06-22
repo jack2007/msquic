@@ -686,6 +686,11 @@ typedef struct QUIC_NETWORK_STATISTICS
     uint32_t SendFlushLastResult;        // Last send flush result enum value
     uint32_t SendFlushLastDatagrams;     // Last send flush datagram count
     uint32_t OutFlowBlockedReasons;      // Last connection out-flow blocked reason bitmask
+    uint64_t LossDetectionEventCount;    // Loss detection batches with retransmittable bytes
+    uint64_t LossDetectionFackPacketCount;// Packets detected lost by packet threshold
+    uint64_t LossDetectionRackPacketCount;// Packets detected lost by time threshold
+    uint64_t LostRetransmittableBytes;   // Sum of retransmittable bytes marked lost
+    uint32_t LastLostRetransmittableBytes;// Last loss batch retransmittable byte count
 
 } QUIC_NETWORK_STATISTICS;
 

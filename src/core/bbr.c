@@ -336,6 +336,11 @@ BbrCongestionControlGetNetworkStatistics(
     NetworkStatistics->SendFlushLastResult = Connection->Stats.SendDiag.LastFlushResult;
     NetworkStatistics->SendFlushLastDatagrams = Connection->Stats.SendDiag.LastFlushDatagrams;
     NetworkStatistics->OutFlowBlockedReasons = Connection->Stats.SendDiag.LastOutFlowBlockedReasons;
+    NetworkStatistics->LossDetectionEventCount = Connection->Stats.SendDiag.LossDetectionEventCount;
+    NetworkStatistics->LossDetectionFackPacketCount = Connection->Stats.SendDiag.LossDetectionFackPacketCount;
+    NetworkStatistics->LossDetectionRackPacketCount = Connection->Stats.SendDiag.LossDetectionRackPacketCount;
+    NetworkStatistics->LostRetransmittableBytes = Connection->Stats.SendDiag.LostRetransmittableBytes;
+    NetworkStatistics->LastLostRetransmittableBytes = Connection->Stats.SendDiag.LastLostRetransmittableBytes;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
