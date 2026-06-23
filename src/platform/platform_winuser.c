@@ -15,6 +15,9 @@ Environment:
 
 #include "platform_internal.h"
 #include <timeapi.h>
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+#include <mimalloc.h>
+#endif
 #ifdef QUIC_CLOG
 #include "platform_winuser.c.clog.h"
 #endif
@@ -459,7 +462,11 @@ CxPlatAlloc(
         return NULL;
     }
 
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    void* Alloc = mi_zalloc(ByteCount + AllocOffset);
+#else
     void* Alloc = HeapAlloc(CxPlatform.Heap, HEAP_ZERO_MEMORY, ByteCount + AllocOffset);
+#endif
     if (Alloc == NULL) {
         return NULL;
     }
@@ -467,7 +474,11 @@ CxPlatAlloc(
     return (void*)((uint8_t*)Alloc + AllocOffset);
 #else
     UNREFERENCED_PARAMETER(Tag);
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    return mi_zalloc(ByteCount);
+#else
     return HeapAlloc(CxPlatform.Heap, HEAP_ZERO_MEMORY, ByteCount);
+#endif
 #endif
 }
 
@@ -486,7 +497,11 @@ CxPlatAllocUninitialized(
         return NULL;
     }
 
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    void* Alloc = mi_malloc(ByteCount + AllocOffset);
+#else
     void* Alloc = HeapAlloc(CxPlatform.Heap, 0, ByteCount + AllocOffset);
+#endif
     if (Alloc == NULL) {
         return NULL;
     }
@@ -494,7 +509,11 @@ CxPlatAllocUninitialized(
     return (void*)((uint8_t*)Alloc + AllocOffset);
 #else
     UNREFERENCED_PARAMETER(Tag);
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    return mi_malloc(ByteCount);
+#else
     return HeapAlloc(CxPlatform.Heap, 0, ByteCount);
+#endif
 #endif
 }
 
@@ -505,17 +524,24 @@ CxPlatFree(
     )
 {
 #ifdef DEBUG
-    void* ActualAlloc = (void*)((uint8_t*)Mem - AllocOffset);
+    void* ActualAlloc = NULL;
     if (Mem != NULL) {
+        ActualAlloc = (void*)((uint8_t*)Mem - AllocOffset);
         uint32_t TagToCheck = *((uint32_t*)ActualAlloc);
         CXPLAT_DBG_ASSERT(TagToCheck == Tag);
-    } else {
-        ActualAlloc = NULL;
     }
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    mi_free(ActualAlloc);
+#else
     (void)HeapFree(CxPlatform.Heap, 0, ActualAlloc);
+#endif
 #else
     UNREFERENCED_PARAMETER(Tag);
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    mi_free(Mem);
+#else
     (void)HeapFree(CxPlatform.Heap, 0, Mem);
+#endif
 #endif
 }
 

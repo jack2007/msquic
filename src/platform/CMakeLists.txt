@@ -81,6 +81,15 @@ endif()
 target_link_libraries(msquic_platform PUBLIC inc)
 target_link_libraries(msquic_platform PRIVATE warnings main_binary_link_args)
 
+if(TCPQUIC_MSQUIC_MIMALLOC_ENABLED)
+    if(NOT TARGET mimalloc-static)
+        message(FATAL_ERROR "TCPQUIC_MSQUIC_MIMALLOC_ENABLED requires the mimalloc-static target")
+    endif()
+    target_compile_definitions(msquic_platform PRIVATE TCPQUIC_MSQUIC_USE_MIMALLOC=1)
+    target_include_directories(msquic_platform PRIVATE "${TCPQUIC_MIMALLOC_SOURCE_DIR}/include")
+    target_link_libraries(msquic_platform PRIVATE mimalloc-static)
+endif()
+
 set_property(TARGET msquic_platform PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}libraries")
 
 if ("${CX_PLATFORM}" STREQUAL "windows")

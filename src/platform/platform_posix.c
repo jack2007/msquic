@@ -26,6 +26,9 @@ Environment:
 #include <limits.h>
 #include <sched.h>
 #include <syslog.h>
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+#include <mimalloc.h>
+#endif
 #define QUIC_VERSION_ONLY 1
 #include "msquic.ver"
 #ifdef QUIC_CLOG
@@ -282,7 +285,11 @@ CxPlatAlloc(
         return NULL;
     }
 #endif
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    return mi_zalloc(ByteCount);
+#else
     return calloc(1, ByteCount);
+#endif
 }
 
 void*
@@ -300,7 +307,11 @@ CxPlatAllocUninitialized(
         return NULL;
     }
 #endif
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    return mi_malloc(ByteCount);
+#else
     return malloc(ByteCount);
+#endif
 }
 
 void
@@ -310,7 +321,11 @@ CxPlatFree(
     )
 {
     UNREFERENCED_PARAMETER(Tag);
+#ifdef TCPQUIC_MSQUIC_USE_MIMALLOC
+    mi_free(Mem);
+#else
     free(Mem);
+#endif
 }
 
 void

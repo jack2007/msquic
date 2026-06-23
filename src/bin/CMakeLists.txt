@@ -35,6 +35,9 @@ else()
     # Here, we exclude the inc interface target which includes various system
     # libraries we do not wish to archive for distribution.
     set(EXCLUDE_LIST "inc")
+    if(TCPQUIC_MSQUIC_MIMALLOC_ENABLED)
+        list(APPEND EXCLUDE_LIST pthread rt atomic)
+    endif()
     if (CX_PLATFORM STREQUAL "darwin")
         list(APPEND EXCLUDE_LIST "-framework CoreFoundation" "-framework Security")
     endif()
