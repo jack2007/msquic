@@ -15,6 +15,7 @@ if("${CX_PLATFORM}" STREQUAL "windows")
     set(SOURCES ${SOURCES} platform_winuser.c storage_winuser.c datapath_win.c datapath_winuser.c datapath_xplat.c)
     if(QUIC_UWP_BUILD OR
        QUIC_GAMECORE_BUILD OR
+       QUIC_DISABLE_XDP OR
        ${SYSTEM_PROCESSOR} STREQUAL "arm" OR
        ${SYSTEM_PROCESSOR} STREQUAL "arm64" OR
        ${SYSTEM_PROCESSOR} STREQUAL "arm64ec")
@@ -86,8 +87,13 @@ if ("${CX_PLATFORM}" STREQUAL "windows")
     target_include_directories(
         msquic_platform
         PRIVATE
-        ${EXTRA_PLATFORM_INCLUDE_DIRECTORIES}
-        ${PROJECT_SOURCE_DIR}/submodules/xdp-for-windows/published/external)
+        ${EXTRA_PLATFORM_INCLUDE_DIRECTORIES})
+    if(NOT QUIC_DISABLE_XDP)
+        target_include_directories(
+            msquic_platform
+            PRIVATE
+            ${PROJECT_SOURCE_DIR}/submodules/xdp-for-windows/published/external)
+    endif()
 else()
     target_include_directories(msquic_platform PRIVATE ${EXTRA_PLATFORM_INCLUDE_DIRECTORIES})
 endif()
