@@ -992,6 +992,15 @@ QuicStreamRecvFlush(
             //
             // FIN only case.
             //
+            if (Stream->RecvMaxLength == UINT64_MAX) {
+                //
+                // No unread data is not sufficient to indicate FIN. In
+                // multi-receive mode, all contiguous data may already be
+                // pending with the app while the final size is still unknown.
+                //
+                FlushRecv = FALSE;
+                break;
+            }
             Event.RECEIVE.AbsoluteOffset = Stream->RecvMaxLength;
             Event.RECEIVE.BufferCount = 0;
             Event.RECEIVE.Flags |= QUIC_RECEIVE_FLAG_FIN; // TODO - 0-RTT flag?
