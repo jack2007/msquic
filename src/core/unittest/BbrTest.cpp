@@ -132,6 +132,9 @@ static QUIC_MAX_SENT_PACKET_METADATA MakeBbrPacket(
 //
 class BbrTest_DeepTest : public ::testing::Test {
 protected:
+    static constexpr uint64_t ProbeRttExpirationUs = 20 * 1000 * 1000;
+    static constexpr uint32_t ProbeRttCwndInMss = 20;
+
     bool NetStatsCallbackInvoked = false;
     QUIC_NETWORK_STATISTICS LastNetStats = {};
 
@@ -309,7 +312,7 @@ protected:
 
     //
     // Helper: drive BBR to PROBE_RTT state by establishing MinRtt then
-    // expiring it with a second ACK 11 seconds later.
+    // expiring it with a second ACK after the ProbeRTT expiration interval.
     // Returns the ExpiredTime used so callers can build on it.
     //
     uint64_t DriveToProbeRtt()
@@ -319,7 +322,7 @@ protected:
         CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
 
         CC->QuicCongestionControlOnDataSent(CC, 1000);
-        uint64_t ExpiredTime = 1000000 + 11000000;
+        uint64_t ExpiredTime = 1000000 + ProbeRttExpirationUs + 1000000;
         QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(ExpiredTime, 3, 4, 1000, 50000, 35000, TRUE);
         CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
         return ExpiredTime;
@@ -472,10 +475,34 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttUpdate)
 }
 
 //
-// Test: OnDataAcknowledged - MinRtt Expires and Updates to New Value
+// Test: OnDataAcknowledged - MinRtt Does Not Expire at Old Ten Second Interval
 // Scenario: First ACK establishes MinRtt=30000us. Second ACK arrives 11 seconds later
-// (past kBbrMinRttExpirationInMicroSecs=10s) with MinRtt=50000us. Since the old MinRtt
-// has expired, BBR accepts the new (larger) value.
+// with MinRtt=50000us. Since the ProbeRTT expiration interval is 20 seconds, BBR keeps
+// the older lower MinRtt and does not enter PROBE_RTT.
+//
+TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttNotExpiredAtOldInterval)
+{
+    InitializeWithDefaults();
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+    QUIC_ACK_EVENT Ack1 = MakeBbrAckEvent(1000000, 1, 2, 1200, 50000, 30000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
+    ASSERT_EQ(Bbr->MinRtt, 30000u);
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+    uint64_t NotExpiredTime = 1000000 + 11000000;
+    QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(NotExpiredTime, 3, 4, 1200, 50000, 50000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
+
+    ASSERT_EQ(Bbr->MinRtt, 30000u);
+    ASSERT_NE(Bbr->BbrState, (uint32_t)BBR_STATE_PROBE_RTT);
+}
+
+//
+// Test: OnDataAcknowledged - MinRtt Expires and Updates to New Value
+// Scenario: First ACK establishes MinRtt=30000us. Second ACK arrives after the
+// 20 second expiration interval with MinRtt=50000us. Since the old MinRtt has
+// expired, BBR accepts the new (larger) value.
 //
 TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttExpired)
 {
@@ -487,9 +514,9 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttExpired)
     CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
     ASSERT_EQ(Bbr->MinRtt, 30000u);
 
-    // Second ACK 11 seconds later - MinRtt expires (kBbrMinRttExpirationInMicroSecs = 10s)
+    // Second ACK after the configured ProbeRTT expiration interval.
     CC->QuicCongestionControlOnDataSent(CC, 5000);
-    uint64_t ExpiredTime = 1000000 + 11000000; // 11 seconds later
+    uint64_t ExpiredTime = 1000000 + ProbeRttExpirationUs + 1000000;
     QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(ExpiredTime, 3, 4, 1200, 50000, 50000, TRUE);
     CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
 
@@ -623,8 +650,8 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_RecoveryStayUpdateWindow)
 //
 // Test: OnDataAcknowledged - Transition to PROBE_RTT When MinRtt Expires
 // Scenario: First ACK at T=1000000 establishes MinRtt=30000 and sets MinRttTimestamp.
-// Second ACK arrives 11 seconds later (past the 10s expiration). With
-// ExitingQuiescence=FALSE, the expired MinRtt triggers a transition to BBR_STATE_PROBE_RTT.
+// Second ACK arrives after the 20s expiration. With ExitingQuiescence=FALSE, the
+// expired MinRtt triggers a transition to BBR_STATE_PROBE_RTT.
 //
 TEST_F(BbrTest_DeepTest, OnDataAcknowledged_TransitToProbeRtt)
 {
@@ -637,7 +664,7 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_TransitToProbeRtt)
 // Test: OnDataAcknowledged - ExitingQuiescence Suppresses PROBE_RTT
 // Scenario: Establishes MinRtt via first ACK, then drains BytesInFlight to 0 and sets
 // AppLimited. The next OnDataSent sets ExitingQuiescence=TRUE (BytesInFlight was 0 and
-// AppLimited). An ACK 11 seconds later with expired MinRtt would normally trigger
+// AppLimited). An ACK after the expiration interval with expired MinRtt would normally trigger
 // PROBE_RTT, but ExitingQuiescence suppresses the transition and is then cleared.
 //
 TEST_F(BbrTest_DeepTest, OnDataAcknowledged_ExitingQuiescenceSuppressesProbeRtt)
@@ -661,7 +688,7 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_ExitingQuiescenceSuppressesProbeRtt)
 
     // Now send+ack with expired MinRtt but ExitingQuiescence = TRUE
     CC->QuicCongestionControlOnDataSent(CC, 5000); // This should set ExitingQuiescence
-    uint64_t ExpiredTime = 1000000 + 11000000;
+    uint64_t ExpiredTime = 1000000 + ProbeRttExpirationUs + 1000000;
     QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(ExpiredTime, 10, 12, 1200, 50000, 35000, TRUE);
     CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
 
@@ -770,10 +797,10 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_DrainToProbeBw)
 
 //
 // Test: HandleAckInProbeRtt - Start ProbeRtt Timer
-// Scenario: Drives BBR to PROBE_RTT by establishing MinRtt, then sending an ACK 11
-// seconds later to expire the MinRtt timer. Once in PROBE_RTT, sends 100 bytes and
+// Scenario: Drives BBR to PROBE_RTT by establishing MinRtt, then sending an ACK after
+// the expiration interval to expire the MinRtt timer. Once in PROBE_RTT, sends 100 bytes and
 // ACKs to trigger the probe RTT timer start (BytesInFlight falls below the probe
-// threshold of 4*DatagramPayloadLength).
+// threshold derived from the ProbeRTT congestion window).
 //
 TEST_F(BbrTest_DeepTest, HandleAckInProbeRtt_StartTimer)
 {
@@ -817,7 +844,7 @@ TEST_F(BbrTest_DeepTest, HandleAckInProbeRtt_ExitToStartup)
 //
 // Test: HandleAckInProbeRtt - Exit PROBE_RTT to PROBE_BW
 // Scenario: Drives BBR to PROBE_BW via DriveToBtlbwFound() (BtlbwFound=TRUE), then
-// triggers PROBE_RTT by waiting 11 seconds for MinRtt expiration. Pumps small send/ack
+// triggers PROBE_RTT by waiting for MinRtt expiration. Pumps small send/ack
 // pairs over 30 iterations until the ProbeRtt timer expires. With BtlbwFound=TRUE, BBR
 // transitions to PROBE_BW instead of STARTUP.
 //
@@ -837,8 +864,8 @@ TEST_F(BbrTest_DeepTest, HandleAckInProbeRtt_ExitToProbeBw)
         if (Bbr->BbrState == (uint32_t)BBR_STATE_PROBE_BW) break;
     }
 
-    // Now trigger PROBE_RTT by waiting 10+ seconds
-    uint64_t ExpiredTime = TimeNow + 11000000;
+    // Now trigger PROBE_RTT by waiting for the expiration interval
+    uint64_t ExpiredTime = TimeNow + ProbeRttExpirationUs + 1000000;
     CC->QuicCongestionControlOnDataSent(CC, 1000);
     QUIC_ACK_EVENT AckExpired = MakeBbrAckEvent(ExpiredTime, 300, 310, 1000, 50000, 35000, TRUE);
     CC->QuicCongestionControlOnDataAcknowledged(CC, &AckExpired);
@@ -1045,15 +1072,15 @@ TEST_F(BbrTest_DeepTest, GetCongestionWindow_InRecovery)
 //
 // Test: GetCongestionWindow - Returns MinCW in PROBE_RTT
 // Scenario: Drives BBR to PROBE_RTT state by establishing MinRtt, then sending an
-// ACK 11 seconds later to expire the MinRtt timer. In PROBE_RTT, GetCongestionWindow
-// returns the minimum congestion window (4 * DatagramPayloadLength).
+// ACK after the expiration interval to expire the MinRtt timer. In PROBE_RTT,
+// GetCongestionWindow returns the ProbeRTT congestion window.
 //
 TEST_F(BbrTest_DeepTest, GetCongestionWindow_ProbeRtt)
 {
     InitializeWithDefaults();
     const uint16_t DatagramPayloadLength =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
-    uint32_t MinCW = 4 * DatagramPayloadLength;
+    uint32_t MinCW = ProbeRttCwndInMss * DatagramPayloadLength;
 
     DriveToProbeRtt();
     ASSERT_EQ(Bbr->BbrState, (uint32_t)BBR_STATE_PROBE_RTT);

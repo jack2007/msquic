@@ -55,6 +55,8 @@ const uint64_t kQuantaFactor = 3;
 
 const uint32_t kMinCwndInMss = 4;
 
+const uint32_t kProbeRttCwndInMss = 20;
+
 const uint32_t kDefaultRecoveryCwndInMss = 2000;
 
 const uint64_t kMicroSecsInSec = 1000000;
@@ -103,7 +105,7 @@ const uint32_t kProbeRttTimeInUs = 200 * 1000;
 //
 // Time until a MinRtt measurement is expired.
 //
-const uint32_t kBbrMinRttExpirationInMicroSecs = S_TO_US(10);
+const uint32_t kBbrMinRttExpirationInMicroSecs = S_TO_US(20);
 
 const uint32_t kBbrMaxBandwidthFilterLen = 10;
 
@@ -222,10 +224,8 @@ BbrCongestionControlGetCongestionWindow(
     const uint16_t DatagramPayloadLength =
         QuicPathGetDatagramPayloadSize(&Connection->Paths[0]);
 
-    uint32_t MinCongestionWindow = kMinCwndInMss * DatagramPayloadLength;
-
     if (Bbr->BbrState == BBR_STATE_PROBE_RTT) {
-        return MinCongestionWindow;
+        return kProbeRttCwndInMss * DatagramPayloadLength;
     }
 
     if (BbrCongestionControlInRecovery(Cc)) {
