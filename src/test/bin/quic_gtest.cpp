@@ -390,6 +390,26 @@ TEST(ParameterValidation, ValidateGetPerfCounters) {
     }
 }
 
+#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+TEST(ParameterValidation, ValidateEncryptDecryptPerfCounters) {
+    TestLogger Logger("QuicTestValidateEncryptDecryptPerfCounters");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestValidateEncryptDecryptPerfCounters)));
+    } else {
+        QuicTestValidateEncryptDecryptPerfCounters();
+    }
+}
+
+TEST(ParameterValidation, ConnQueueDelayStatistics) {
+    TestLogger Logger("QuicTestConnQueueDelayStatistics");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestConnQueueDelayStatistics)));
+    } else {
+        QuicTestConnQueueDelayStatistics();
+    }
+}
+#endif // QUIC_API_ENABLE_PREVIEW_FEATURES
+
 TEST(ParameterValidation, ValidateConfiguration) {
 #ifdef QUIC_TEST_SCHANNEL_FLAGS
     if (IsWindows2022()) {
