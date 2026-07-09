@@ -322,6 +322,16 @@
     },
     {
       "type": "Conceptual",
+      "source_relative_path": "docs/api/ConnectionExportKeyingMaterial.md",
+      "output": {
+        ".html": {
+          "relative_path": "docs/api/ConnectionExportKeyingMaterial.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Conceptual",
       "source_relative_path": "docs/api/ConnectionOpen.md",
       "output": {
         ".html": {
@@ -406,6 +416,36 @@
       "output": {
         ".html": {
           "relative_path": "docs/api/DatagramSend.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Conceptual",
+      "source_relative_path": "docs/api/ExecutionCreate.md",
+      "output": {
+        ".html": {
+          "relative_path": "docs/api/ExecutionCreate.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Conceptual",
+      "source_relative_path": "docs/api/ExecutionDelete.md",
+      "output": {
+        ".html": {
+          "relative_path": "docs/api/ExecutionDelete.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Conceptual",
+      "source_relative_path": "docs/api/ExecutionPoll.md",
+      "output": {
+        ".html": {
+          "relative_path": "docs/api/ExecutionPoll.html"
         }
       },
       "version": ""
@@ -556,6 +596,16 @@
       "output": {
         ".html": {
           "relative_path": "docs/api/QUIC_HANDSHAKE_INFO.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Conceptual",
+      "source_relative_path": "docs/api/QUIC_KEYING_MATERIAL_CONFIG.md",
+      "output": {
+        ".html": {
+          "relative_path": "docs/api/QUIC_KEYING_MATERIAL_CONFIG.html"
         }
       },
       "version": ""
@@ -1108,6 +1158,246 @@
       "output": {
         ".html": {
           "relative_path": "index.html"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-1.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-1.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-2.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-2.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-3.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-3.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-4.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-4.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-5.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-5.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-6.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-6.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-7.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-7.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/cpu-debug-8.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/cpu-debug-8.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/icon.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/icon.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/nic-recv-buffers.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/nic-recv-buffers.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/perfmon.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/perfmon.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/ptp-timestamp-config.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/ptp-timestamp-config.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/readme_logo.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/readme_logo.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/rss-debug-1.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/rss-debug-1.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/rss-debug-2.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/rss-debug-2.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/rss-debug-3.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/rss-debug-3.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/tat.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/tat.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/tx-blocked-state.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/tx-blocked-state.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/docs/images/udp-perf-counters.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/docs/images/udp-perf-counters.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/src/plugins/trace/images/flame.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/src/plugins/trace/images/flame.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/src/plugins/trace/images/quic_network.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/src/plugins/trace/images/quic_network.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/src/plugins/trace/images/wpa.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/src/plugins/trace/images/wpa.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/src/plugins/trace/images/wpa_perf_flamegraph.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/src/plugins/trace/images/wpa_perf_flamegraph.png"
+        }
+      },
+      "version": ""
+    },
+    {
+      "type": "Resource",
+      "source_relative_path": "msquicdocs/src/plugins/trace/images/wpa_perf_line.png",
+      "output": {
+        "resource": {
+          "relative_path": "msquicdocs/src/plugins/trace/images/wpa_perf_line.png"
         }
       },
       "version": ""
