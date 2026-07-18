@@ -569,6 +569,62 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttNoUpdate)
 }
 
 //
+// Test: OnDataAcknowledged - Refresh MinRtt After Persistent Path Change
+// Scenario: A persistent connection fully drains while the path RTT changes from
+// 1ms to 50ms. The application-limited flag is not guaranteed to be set by the
+// transport integration, so the RTT shift itself must refresh the stale sample.
+//
+TEST_F(BbrTest_DeepTest, OnDataAcknowledged_RefreshMinRttAfterPersistentPathChange)
+{
+    InitializeWithDefaults();
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+    QUIC_ACK_EVENT Ack1 = MakeBbrAckEvent(1000000, 1, 2, 1200, 1100, 1000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
+    ASSERT_EQ(Bbr->MinRtt, 1000u);
+
+    uint32_t Remaining = Bbr->BytesInFlight;
+    QUIC_ACK_EVENT AckAll = MakeBbrAckEvent(1050000, 3, 4, Remaining, 1100, 1000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &AckAll);
+    ASSERT_EQ(Bbr->BytesInFlight, 0u);
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+    ASSERT_FALSE(Bbr->ExitingQuiescence);
+
+    QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(1100000, 5, 6, 1200, 52000, 50000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
+
+    ASSERT_EQ(Bbr->MinRtt, 50000u);
+}
+
+//
+// Test: OnDataAcknowledged - Keep MinRtt After Small Quiescent RTT Increase
+// Scenario: Exiting quiescence alone must not replace MinRtt with a modestly
+// larger sample caused by normal queueing variation.
+//
+TEST_F(BbrTest_DeepTest, OnDataAcknowledged_KeepMinRttAfterSmallQuiescentRttIncrease)
+{
+    InitializeWithDefaults();
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+    QUIC_ACK_EVENT Ack1 = MakeBbrAckEvent(1000000, 1, 2, 1200, 32000, 30000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
+
+    uint32_t Remaining = Bbr->BytesInFlight;
+    QUIC_ACK_EVENT AckAll = MakeBbrAckEvent(1050000, 3, 4, Remaining, 32000, 30000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &AckAll);
+    ASSERT_EQ(Bbr->BytesInFlight, 0u);
+
+    CC->QuicCongestionControlSetAppLimited(CC);
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+
+    QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(1100000, 5, 6, 1200, 45000, 40000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
+
+    ASSERT_EQ(Bbr->MinRtt, 30000u);
+}
+
+//
 // Test: OnDataAcknowledged - New Round Trip Detection
 // Scenario: Sends 5000 bytes via OnDataSent, then acknowledges 1200 bytes with
 // LargestAck=5. Since this is the first ACK, it triggers a new round trip.
