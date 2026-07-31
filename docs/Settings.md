@@ -116,6 +116,26 @@ A [QUIC_SETTINGS](./api/QUIC_SETTINGS.md) struct is used to configure settings o
 
 For more details see [QUIC_SETTINGS](./api/QUIC_SETTINGS.md).
 
+### Fork-specific maximum BBR pacing rate
+
+This fork appends `MaxPacingRateBytesPerSecond` to `QUIC_SETTINGS` and assigns
+it `IsSet` bit 46. A nonzero value limits the effective pacing rate of the
+local BBR sender on each connection, in bytes per second; zero disables the
+limit. The limit is per connection and per direction. It does not aggregate
+across connections or configure the peer.
+
+The setting is consumed when the connection is created and is not hot-applied
+to an already started connection. It affects only BBR when pacing is enabled,
+without clamping the raw BBR bandwidth estimate, changing the congestion
+window, changing peer behavior, or changing the wire protocol. The paced data
+path uses bounded byte credit and starts with one bootstrap datagram. ACK-only
+traffic and congestion-control bypass or recovery traffic can produce short
+bursts, so this is a soft pacing limit rather than a hard on-wire shaper.
+
+The preview `QUIC_NETWORK_STATISTICS` reports three separate byte-per-second
+values: raw `Bandwidth`, configured `MaxPacingRateBytesPerSecond`, and
+post-limit `EffectivePacingRateBytesPerSecond`.
+
 # API Object Parameters
 
 MsQuic API Objects have a number of settings, or parameters, which can be queried via [GetParam](api/GetParam.md), or can be set/modifed via [SetParam](api/SetParam.md).

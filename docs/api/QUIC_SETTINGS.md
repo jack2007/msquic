@@ -58,9 +58,12 @@ typedef struct QUIC_SETTINGS {
             uint64_t XdpEnabled                             : 1;
             uint64_t QTIPEnabled                            : 1;
             uint64_t ReservedRioEnabled                     : 1;
-            uint64_t RESERVED                               : 18;
+            uint64_t MaxPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 17;
 #else
-            uint64_t RESERVED                               : 26;
+            uint64_t RESERVED_PREVIEW                       : 8;
+            uint64_t MaxPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 17;
 #endif
         } IsSet;
     };
@@ -121,6 +124,7 @@ typedef struct QUIC_SETTINGS {
     uint32_t StreamRecvWindowBidiLocalDefault;
     uint32_t StreamRecvWindowBidiRemoteDefault;
     uint32_t StreamRecvWindowUnidiDefault;
+    uint64_t MaxPacingRateBytesPerSecond;
 
 } QUIC_SETTINGS;
 ```
@@ -268,6 +272,28 @@ Buffer send data within MsQuic instead of holding application buffers until sent
 Pace sending to avoid overfilling buffers on the path.
 
 **Default value:** 1 (`TRUE`)
+
+`MaxPacingRateBytesPerSecond`
+
+Limits the effective pacing rate of the local BBR sender for each connection,
+in bytes per second. Set the corresponding `IsSet` bit (bit 46) when supplying
+the value. Zero disables the limit.
+
+The limit is local and directional: each endpoint independently limits only
+its own sender, and every connection has a separate limit and byte-credit
+state. It applies only to BBR with pacing enabled. It does not change BBR's raw
+bandwidth estimate, congestion window, peer behavior, or the QUIC wire
+protocol.
+
+The setting is consumed when a connection is created. Changing a
+Configuration or setting value does not dynamically update an already started
+connection. Normal ack-eliciting traffic is paced with bounded byte credit;
+the first datagram provides bootstrap progress, and later credit is bounded by
+the greater of one datagram and one pacing quantum. ACK-only traffic and
+congestion-control bypass or recovery traffic are not a hard rate guarantee
+and can cause short bursts above the configured rate.
+
+**Default value:** 0 (disabled)
 
 `MigrationEnabled`
 

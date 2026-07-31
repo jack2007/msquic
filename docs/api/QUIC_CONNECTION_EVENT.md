@@ -467,7 +467,19 @@ Congestion Window
 
 `Bandwidth`
 
-Estimated bandwidth
+Raw BBR bandwidth estimate, in bytes per second. This value is not clamped by
+`MaxPacingRateBytesPerSecond`.
+
+`MaxPacingRateBytesPerSecond`
+
+Configured maximum pacing rate for the local sender on this connection, in
+bytes per second. Zero means that no maximum is configured.
+
+`EffectivePacingRateBytesPerSecond`
+
+Effective local BBR pacing rate after applying the configured maximum, in
+bytes per second. This is distinct from both the raw `Bandwidth` estimate and
+the configured maximum.
 
 
 # See Also
