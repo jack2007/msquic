@@ -211,6 +211,73 @@ BbrCongestionControlGetBandwidth(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+BbrSaturatingMultiplyDivide(
+    _In_ uint64_t Value,
+    _In_ uint32_t Multiplier,
+    _In_ uint64_t Divisor
+    )
+{
+    const uint64_t Quotient = Value / Divisor;
+    const uint64_t Remainder = Value % Divisor;
+
+    if (Quotient != 0 && Multiplier > UINT64_MAX / Quotient) {
+        return UINT64_MAX;
+    }
+
+    const uint64_t Whole = Quotient * Multiplier;
+    const uint64_t Fraction = Remainder * Multiplier / Divisor;
+    if (Whole > UINT64_MAX - Fraction) {
+        return UINT64_MAX;
+    }
+    return Whole + Fraction;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+BbrSaturatingMultiplyDivideCeil(
+    _In_ uint64_t Value,
+    _In_ uint32_t Multiplier,
+    _In_ uint64_t Divisor
+    )
+{
+    const uint64_t Result =
+        BbrSaturatingMultiplyDivide(Value, Multiplier, Divisor);
+    if (Result == UINT64_MAX) {
+        return UINT64_MAX;
+    }
+
+    const uint64_t RemainderProduct = (Value % Divisor) * Multiplier;
+    return Result + (RemainderProduct % Divisor != 0);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+uint64_t
+BbrCongestionControlGetEffectivePacingRate(
+    _In_ const QUIC_CONGESTION_CONTROL* Cc
+    )
+{
+    const QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
+    const uint64_t EstimatedBandwidthBytesPerSecond =
+        BbrCongestionControlGetBandwidth(Cc) / BW_UNIT;
+    const uint64_t EstimatedPacingRateBytesPerSecond =
+        BbrSaturatingMultiplyDivide(
+            EstimatedBandwidthBytesPerSecond,
+            Cc->Bbr.PacingGain,
+            GAIN_UNIT);
+    const uint64_t MaxRate =
+        Connection->Settings.MaxPacingRateBytesPerSecond;
+
+    if (MaxRate == 0 || !Connection->Settings.PacingEnabled) {
+        return EstimatedPacingRateBytesPerSecond;
+    }
+    if (EstimatedBandwidthBytesPerSecond == 0) {
+        return MaxRate;
+    }
+    return CXPLAT_MIN(EstimatedPacingRateBytesPerSecond, MaxRate);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 BbrCongestionControlInRecovery(
     _In_ const QUIC_CONGESTION_CONTROL* Cc
@@ -348,6 +415,10 @@ BbrCongestionControlGetNetworkStatistics(
     NetworkStatistics->LossDetectionRackPacketCount = Connection->Stats.SendDiag.LossDetectionRackPacketCount;
     NetworkStatistics->LostRetransmittableBytes = Connection->Stats.SendDiag.LostRetransmittableBytes;
     NetworkStatistics->LastLostRetransmittableBytes = Connection->Stats.SendDiag.LastLostRetransmittableBytes;
+    NetworkStatistics->MaxPacingRateBytesPerSecond =
+        Connection->Settings.MaxPacingRateBytesPerSecond;
+    NetworkStatistics->EffectivePacingRateBytesPerSecond =
+        BbrCongestionControlGetEffectivePacingRate(Cc);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -475,8 +546,17 @@ BbrCongestionControlOnDataSent(
     )
 {
     QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+    QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
 
     BOOLEAN PreviousCanSendState = BbrCongestionControlCanSend(Cc);
+
+    if (
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
+        Connection->Settings.PacingEnabled) {
+        Bbr->RateLimitBudgetBytes =
+            NumRetransmittableBytes >= Bbr->RateLimitBudgetBytes ?
+                0 : Bbr->RateLimitBudgetBytes - NumRetransmittableBytes;
+    }
 
     if (!Bbr->BytesInFlight && BbrCongestionControlIsAppLimited(Cc)) {
         Bbr->ExitingQuiescence = TRUE;
@@ -650,6 +730,72 @@ BbrCongestionControlGetTargetCwnd(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static uint32_t
+BbrCongestionControlGetRateLimitBurstCapacity(
+    _In_ QUIC_CONGESTION_CONTROL* Cc
+    )
+{
+    const QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
+    const uint32_t DatagramPayloadLength =
+        QuicPathGetDatagramPayloadSize(&Connection->Paths[0]);
+    const uint64_t PacingQuantumBytes =
+        BbrSaturatingMultiplyDivideCeil(
+            BbrCongestionControlGetEffectivePacingRate(Cc),
+            QUIC_SEND_PACING_INTERVAL,
+            kMicroSecsInSec);
+    const uint64_t BurstCapacity =
+        CXPLAT_MAX((uint64_t)DatagramPayloadLength, PacingQuantumBytes);
+    return (uint32_t)CXPLAT_MIN(BurstCapacity, (uint64_t)UINT32_MAX);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static void
+BbrCongestionControlRefillRateLimitBudget(
+    _In_ QUIC_CONGESTION_CONTROL* Cc,
+    _In_ uint64_t TimeSinceLastSend,
+    _In_ BOOLEAN TimeSinceLastSendValid
+    )
+{
+    QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+    const uint64_t BurstCapacity =
+        BbrCongestionControlGetRateLimitBurstCapacity(Cc);
+
+    if (Bbr->RateLimitBudgetBytes > BurstCapacity) {
+        Bbr->RateLimitBudgetBytes = BurstCapacity;
+    }
+    if (Bbr->RateLimitBudgetBytes == BurstCapacity) {
+        Bbr->RateLimitRemainderNumerator = 0;
+        return;
+    }
+    if (!TimeSinceLastSendValid) {
+        return;
+    }
+
+    const uint64_t EffectiveRate =
+        BbrCongestionControlGetEffectivePacingRate(Cc);
+    const uint64_t MissingBytes =
+        BurstCapacity - Bbr->RateLimitBudgetBytes;
+    const uint64_t NumeratorNeeded =
+        MissingBytes * kMicroSecsInSec -
+        Bbr->RateLimitRemainderNumerator;
+    const uint64_t TimeToFill =
+        NumeratorNeeded / EffectiveRate +
+        (NumeratorNeeded % EffectiveRate != 0);
+
+    if (TimeSinceLastSend >= TimeToFill) {
+        Bbr->RateLimitBudgetBytes = BurstCapacity;
+        Bbr->RateLimitRemainderNumerator = 0;
+        return;
+    }
+
+    const uint64_t AddedNumerator =
+        EffectiveRate * TimeSinceLastSend +
+        Bbr->RateLimitRemainderNumerator;
+    Bbr->RateLimitBudgetBytes += AddedNumerator / kMicroSecsInSec;
+    Bbr->RateLimitRemainderNumerator = AddedNumerator % kMicroSecsInSec;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 uint32_t
 BbrCongestionControlGetSendAllowance(
     _In_ QUIC_CONGESTION_CONTROL* Cc,
@@ -703,7 +849,24 @@ BbrCongestionControlGetSendAllowance(
             SendAllowance = CongestionWindow >> 2; // Don't send more than a quarter of the current window.
         }
     }
-    return SendAllowance;
+    if (
+        Connection->Settings.MaxPacingRateBytesPerSecond == 0 ||
+        !Connection->Settings.PacingEnabled) {
+        return SendAllowance;
+    }
+
+    BbrCongestionControlRefillRateLimitBudget(
+        Cc, TimeSinceLastSend, TimeSinceLastSendValid);
+
+    const uint32_t DatagramPayloadLength =
+        QuicPathGetDatagramPayloadSize(&Connection->Paths[0]);
+    if (Bbr->RateLimitBudgetBytes < DatagramPayloadLength) {
+        return 0;
+    }
+
+    return (uint32_t)CXPLAT_MIN(
+        (uint64_t)SendAllowance,
+        CXPLAT_MIN(Bbr->RateLimitBudgetBytes, (uint64_t)UINT32_MAX));
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1102,6 +1265,12 @@ BbrCongestionControlReset(
     Bbr->BandwidthFilter.AppLimited = FALSE;
     Bbr->BandwidthFilter.AppLimitedExitTarget = 0;
 
+    Bbr->RateLimitRemainderNumerator = 0;
+    Bbr->RateLimitBudgetBytes =
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
+        Connection->Settings.PacingEnabled ?
+            DatagramPayloadLength : 0;
+
     BbrCongestionControlLogOutFlowStatus(Cc);
     QuicConnLogBbr(Connection);
 }
@@ -1198,6 +1367,12 @@ BbrCongestionControlInitialize(
         .AppLimited = FALSE,
         .AppLimitedExitTarget = 0,
     };
+
+    Bbr->RateLimitRemainderNumerator = 0;
+    Bbr->RateLimitBudgetBytes =
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
+        Connection->Settings.PacingEnabled ?
+            DatagramPayloadLength : 0;
 
     QuicConnLogOutFlowStats(Connection);
     QuicConnLogBbr(Connection);

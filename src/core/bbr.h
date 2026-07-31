@@ -217,6 +217,12 @@ typedef struct QUIC_CONGESTION_CONTROL_BBR {
     //
     BBR_BANDWIDTH_FILTER BandwidthFilter;
 
+    //
+    // Bounded byte credit for the configured per-connection pacing-rate cap.
+    //
+    uint64_t RateLimitBudgetBytes;
+    uint64_t RateLimitRemainderNumerator;
+
 } QUIC_CONGESTION_CONTROL_BBR;
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

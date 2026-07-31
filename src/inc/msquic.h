@@ -700,6 +700,8 @@ typedef struct QUIC_NETWORK_STATISTICS
     uint64_t LossDetectionRackPacketCount;// Packets detected lost by time threshold
     uint64_t LostRetransmittableBytes;   // Sum of retransmittable bytes marked lost
     uint32_t LastLostRetransmittableBytes;// Last loss batch retransmittable byte count
+    uint64_t MaxPacingRateBytesPerSecond; // Configured per-connection pacing-rate cap
+    uint64_t EffectivePacingRateBytesPerSecond; // Effective BBR pacing rate after applying the cap
 
 } QUIC_NETWORK_STATISTICS;
 

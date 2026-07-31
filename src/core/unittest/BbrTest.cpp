@@ -18,6 +18,10 @@ extern "C" {
 void BbrCongestionControlInitialize(QUIC_CONGESTION_CONTROL* Cc, const QUIC_SETTINGS_INTERNAL* Settings);
 uint64_t BbrCongestionControlGetBandwidth(const QUIC_CONGESTION_CONTROL* Cc);
 uint32_t BbrCongestionControlGetTargetCwnd(QUIC_CONGESTION_CONTROL* Cc, uint32_t Gain);
+void BbrCongestionControlGetNetworkStatistics(
+    const QUIC_CONNECTION* Connection,
+    const QUIC_CONGESTION_CONTROL* Cc,
+    QUIC_NETWORK_STATISTICS* NetworkStatistics);
 }
 
 //
@@ -167,12 +171,17 @@ protected:
         uint32_t WindowPackets = 10,
         uint16_t Mtu = 1280,
         bool PacingEnabled = false,
-        bool NetStatsEnabled = false)
+        bool NetStatsEnabled = false,
+        uint64_t MaxPacingRateBytesPerSecond = 0)
     {
         Settings.InitialWindowPackets = WindowPackets;
+        Settings.MaxPacingRateBytesPerSecond =
+            MaxPacingRateBytesPerSecond;
         InitBbrMockConnection(Connection, Mtu);
         Connection.Settings.PacingEnabled = PacingEnabled ? TRUE : FALSE;
         Connection.Settings.NetStatsEventEnabled = NetStatsEnabled ? TRUE : FALSE;
+        Connection.Settings.MaxPacingRateBytesPerSecond =
+            MaxPacingRateBytesPerSecond;
         if (NetStatsEnabled) {
             Connection.ClientCallbackHandler = DummyConnectionCallback;
             // The callback receives Connection->ClientContext which lives inside the
@@ -2302,4 +2311,274 @@ TEST_F(BbrTest_DeepTest, SetExemption_Zero)
 
     CC->QuicCongestionControlSetExemption(CC, 0);
     ASSERT_EQ(CC->QuicCongestionControlGetExemptions(CC), 0u);
+}
+
+//
+// Per-connection BBR pacing-rate cap tests.
+//
+
+TEST_F(BbrTest_DeepTest, RateLimitZeroPreservesAllowance)
+{
+    InitializeWithDefaults(10, 1280, true, false, 0);
+    const uint64_t BudgetSentinel = 0x123456789abcdef0ULL;
+    const uint64_t RemainderSentinel = 777777;
+    Bbr->RateLimitBudgetBytes = BudgetSentinel;
+    Bbr->RateLimitRemainderNumerator = RemainderSentinel;
+
+    const uint32_t First =
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE);
+    const uint32_t ExpectedFirst = Bbr->CongestionWindow - Bbr->BytesInFlight;
+    ASSERT_EQ(ExpectedFirst, First);
+    ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
+
+    CC->QuicCongestionControlOnDataSent(CC, 200);
+    const uint32_t Second =
+        CC->QuicCongestionControlGetSendAllowance(CC, 500, TRUE);
+    ASSERT_EQ(Bbr->CongestionWindow - Bbr->BytesInFlight, Second);
+    ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitBootstrapsWithoutBandwidthSample)
+{
+    InitializeWithDefaults(10, 1280, true, false, 125);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitLeavesLowerEstimateUnchanged)
+{
+    constexpr uint64_t MaxRate = 1000000000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxRate);
+    PumpBandwidthSample(1050000, 1, 1200, 100000);
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    const uint64_t EstimatedBandwidth = BbrCongestionControlGetBandwidth(CC) / 8;
+    const uint64_t ExpectedPacingRate = EstimatedBandwidth * Bbr->PacingGain / 256;
+    ASSERT_GT(EstimatedBandwidth, 0u);
+    ASSERT_LT(ExpectedPacingRate, MaxRate);
+    ASSERT_EQ(ExpectedPacingRate, Stats.EffectivePacingRateBytesPerSecond);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitCapsStartupCwndFastPath)
+{
+    constexpr uint64_t MaxRate = 125000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    PumpBandwidthSample(1050000, 1, 1200, 1000000, 45000);
+    ASSERT_EQ(Bbr->BbrState, (uint32_t)BBR_STATE_STARTUP);
+
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    ASSERT_EQ(DatagramPayload, Allowance);
+
+    CC->QuicCongestionControlReset(CC, TRUE);
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 500; // Below QUIC_SEND_PACING_INTERVAL.
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitCapsProbeBwHighGain)
+{
+    constexpr uint64_t MaxRate = 125000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxRate);
+    DriveToBtlbwFound();
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingCycleIndex = 0;
+    Bbr->PacingGain = 320; // ProbeBW 1.25 gain.
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    ASSERT_EQ(DatagramPayload, Allowance);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitRequiresFullDatagramCredit)
+{
+    constexpr uint64_t MaxRate = 125;
+    InitializeWithDefaults(10, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+
+    ASSERT_EQ(
+        0u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 9000000, TRUE));
+    const uint64_t MissingBytes = DatagramPayload - 1125;
+    const uint64_t FinalElapsedUs =
+        (MissingBytes * 1000000ULL + MaxRate - 1) / MaxRate;
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, FinalElapsedUs, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitDebitsActualSentBytes)
+{
+    constexpr uint64_t MaxRate = 200000;
+    InitializeWithDefaults(10, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+
+    CC->QuicCongestionControlOnDataSent(CC, 200);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitAccumulatesFractionalCredit)
+{
+    constexpr uint64_t MaxRate = 500000;
+    InitializeWithDefaults(10, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+
+    const uint64_t CallsBeforeFull =
+        ((uint64_t)DatagramPayload * 1000000ULL / MaxRate) - 1;
+    for (uint64_t i = 0; i < CallsBeforeFull; ++i) {
+        ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
+    }
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitCapsIdleBurst)
+{
+    constexpr uint64_t MaxRate = 10000000;
+    constexpr uint32_t PacingQuantum = 10000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    ASSERT_GT(PacingQuantum, DatagramPayload);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE);
+    ASSERT_EQ(PacingQuantum, Allowance);
+    ASSERT_EQ(PacingQuantum, Bbr->RateLimitBudgetBytes);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitResetRestoresOneDatagramBootstrap)
+{
+    InitializeWithDefaults(10, 1280, true, false, 125);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+
+    CC->QuicCongestionControlReset(CC, TRUE);
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitPacingDisabledPreservesOriginalBehavior)
+{
+    InitializeWithDefaults(10, 1280, false, false, 1);
+    const uint32_t Expected = Bbr->CongestionWindow - Bbr->BytesInFlight;
+    ASSERT_EQ(
+        Expected,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+
+    PumpBandwidthSample(1050000, 1, 1200, 100000);
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    const uint64_t ExpectedPacingRate =
+        (BbrCongestionControlGetBandwidth(CC) / 8) * Bbr->PacingGain / 256;
+    ASSERT_GT(ExpectedPacingRate, Connection.Settings.MaxPacingRateBytesPerSecond);
+    ASSERT_EQ(ExpectedPacingRate, Stats.EffectivePacingRateBytesPerSecond);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitCcExemptionStillMakesProgress)
+{
+    constexpr uint64_t MaxRate = 200000;
+    InitializeWithDefaults(10, 1280, true, false, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+
+    CC->QuicCongestionControlSetExemption(CC, 1);
+    ASSERT_TRUE(CC->QuicCongestionControlCanSend(CC));
+    CC->QuicCongestionControlOnDataSent(CC, 200);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetExemptions(CC));
+    ASSERT_EQ(
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(
+            CC,
+            ((uint64_t)DatagramPayload * 1000000ULL + MaxRate - 1) / MaxRate,
+            TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitArithmeticSaturatesSafely)
+{
+    InitializeWithDefaults(2000, 1280, true, false, UINT64_MAX);
+    QuicSlidingWindowExtremumUpdateMax(
+        &Bbr->BandwidthFilter.WindowedMaxFilter, UINT64_MAX, 1);
+    Bbr->PacingGain = UINT32_MAX;
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    ASSERT_EQ(UINT64_MAX, Stats.EffectivePacingRateBytesPerSecond);
+
+    CC->QuicCongestionControlOnDataSent(
+        CC, QuicPathGetDatagramPayloadSize(&Connection.Paths[0]));
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE);
+    ASSERT_EQ(UINT32_MAX, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(Bbr->CongestionWindow - Bbr->BytesInFlight, Allowance);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitDoesNotClampBandwidthStatistic)
+{
+    constexpr uint64_t MaxRate = 100000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxRate);
+    PumpBandwidthSample(1050000, 1, 1200, 1000000);
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    ASSERT_GT(Stats.Bandwidth, MaxRate);
+    ASSERT_EQ(BbrCongestionControlGetBandwidth(CC) / 8, Stats.Bandwidth);
+    ASSERT_LE(Stats.EffectivePacingRateBytesPerSecond, MaxRate);
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitReportsConfiguredAndEffectiveRates)
+{
+    constexpr uint64_t MaxRate = 125000; // 1 Mbps
+    InitializeWithDefaults(2000, 1280, true, true, MaxRate);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    ASSERT_LE(Allowance, DatagramPayload);
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    ASSERT_EQ(MaxRate, Stats.MaxPacingRateBytesPerSecond);
+    ASSERT_LE(Stats.EffectivePacingRateBytesPerSecond, MaxRate);
 }
