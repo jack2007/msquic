@@ -739,6 +739,11 @@ public:
     MsQuicSettings& SetNetStatsEventEnabled(bool value) { NetStatsEventEnabled = value; IsSet.NetStatsEventEnabled = TRUE; return *this; }
     MsQuicSettings& SetStreamMultiReceiveEnabled(bool value) { StreamMultiReceiveEnabled = value; IsSet.StreamMultiReceiveEnabled = TRUE; return *this; }
 #endif
+    MsQuicSettings& SetMaxPacingRateBytesPerSecond(uint64_t Value) {
+        MaxPacingRateBytesPerSecond = Value;
+        IsSet.MaxPacingRateBytesPerSecond = TRUE;
+        return *this;
+    }
 
     QUIC_STATUS
     SetGlobal() const noexcept {

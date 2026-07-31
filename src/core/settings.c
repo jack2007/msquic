@@ -165,6 +165,9 @@ QuicSettingsSetDefault(
     if (!Settings->IsSet.QTIPEnabled) {
         Settings->QTIPEnabled = QUIC_DEFAULT_QTIP_ENABLED;
     }
+    if (!Settings->IsSet.MaxPacingRateBytesPerSecond) {
+        Settings->MaxPacingRateBytesPerSecond = 0;
+    }
     if (!Settings->IsSet.OneWayDelayEnabled) {
         Settings->OneWayDelayEnabled = QUIC_DEFAULT_ONE_WAY_DELAY_ENABLED;
     }
@@ -338,6 +341,10 @@ QuicSettingsCopy(
     }
     if (!Destination->IsSet.QTIPEnabled) {
         Destination->QTIPEnabled = Source->QTIPEnabled;
+    }
+    if (!Destination->IsSet.MaxPacingRateBytesPerSecond) {
+        Destination->MaxPacingRateBytesPerSecond =
+            Source->MaxPacingRateBytesPerSecond;
     }
     if (!Destination->IsSet.OneWayDelayEnabled) {
         Destination->OneWayDelayEnabled = Source->OneWayDelayEnabled;
@@ -732,6 +739,13 @@ QuicSettingApply(
     if (Source->IsSet.QTIPEnabled && (!Destination->IsSet.QTIPEnabled || OverWrite)) {
         Destination->QTIPEnabled = Source->QTIPEnabled;
         Destination->IsSet.QTIPEnabled = TRUE;
+    }
+
+    if (Source->IsSet.MaxPacingRateBytesPerSecond &&
+        (!Destination->IsSet.MaxPacingRateBytesPerSecond || OverWrite)) {
+        Destination->MaxPacingRateBytesPerSecond =
+            Source->MaxPacingRateBytesPerSecond;
+        Destination->IsSet.MaxPacingRateBytesPerSecond = TRUE;
     }
 
 
@@ -1505,6 +1519,7 @@ QuicSettingsDump(
     QuicTraceLogVerbose(SettingReliableResetEnabled,        "[sett] ReliableResetEnabled   = %hhu", Settings->ReliableResetEnabled);
     QuicTraceLogVerbose(SettingXdpEnabled,                  "[sett] XdpEnabled             = %hhu", Settings->XdpEnabled);
     QuicTraceLogVerbose(SettingQTIPEnabled,                 "[sett] QTIPEnabled            = %hhu", Settings->QTIPEnabled);
+    QuicTraceLogVerbose(SettingMaxPacingRateBytesPerSecond, "[sett] MaxPacingRateBytesPerSecond=%llu", Settings->MaxPacingRateBytesPerSecond);
     QuicTraceLogVerbose(SettingOneWayDelayEnabled,          "[sett] OneWayDelayEnabled     = %hhu", Settings->OneWayDelayEnabled);
     QuicTraceLogVerbose(SettingNetStatsEventEnabled,        "[sett] NetStatsEventEnabled   = %hhu", Settings->NetStatsEventEnabled);
     QuicTraceLogVerbose(SettingsStreamMultiReceiveEnabled,  "[sett] StreamMultiReceiveEnabled= %hhu", Settings->StreamMultiReceiveEnabled);
@@ -1668,6 +1683,9 @@ QuicSettingsDumpNew(
     }
     if (Settings->IsSet.QTIPEnabled) {
         QuicTraceLogVerbose(SettingQTIPEnabled,                     "[sett] QTIPEnabled                = %hhu", Settings->QTIPEnabled);
+    }
+    if (Settings->IsSet.MaxPacingRateBytesPerSecond) {
+        QuicTraceLogVerbose(SettingMaxPacingRateBytesPerSecond,     "[sett] MaxPacingRateBytesPerSecond=%llu", Settings->MaxPacingRateBytesPerSecond);
     }
     if (Settings->IsSet.OneWayDelayEnabled) {
         QuicTraceLogVerbose(SettingOneWayDelayEnabled,              "[sett] OneWayDelayEnabled         = %hhu", Settings->OneWayDelayEnabled);
@@ -1952,6 +1970,13 @@ QuicSettingsSettingsToInternal(
         SettingsSize,
         InternalSettings);
 
+    SETTING_COPY_TO_INTERNAL_SIZED(
+        MaxPacingRateBytesPerSecond,
+        QUIC_SETTINGS,
+        Settings,
+        SettingsSize,
+        InternalSettings);
+
     return QUIC_STATUS_SUCCESS;
 }
 
@@ -2132,6 +2157,13 @@ QuicSettingsGetSettings(
     SETTING_COPY_FLAG_FROM_INTERNAL_SIZED(
         Flags,
         StreamMultiReceiveEnabled,
+        QUIC_SETTINGS,
+        Settings,
+        *SettingsLength,
+        InternalSettings);
+
+    SETTING_COPY_FROM_INTERNAL_SIZED(
+        MaxPacingRateBytesPerSecond,
         QUIC_SETTINGS,
         Settings,
         *SettingsLength,
