@@ -394,7 +394,7 @@ TEST(SettingsTest, OldSettingsSizeDoesNotRequireMaxPacingRate)
         (uint32_t)CXPLAT_STRUCT_SIZE_THRU_FIELD(
             QUIC_SETTINGS,
             StreamRecvWindowUnidiDefault);
-    uint8_t Buffer[sizeof(QUIC_SETTINGS)];
+    alignas(QUIC_SETTINGS) uint8_t Buffer[sizeof(QUIC_SETTINGS)];
     CxPlatZeroMemory(Buffer, sizeof(Buffer));
     const uint8_t Canary = 0xA5;
     for (uint32_t i = OldSize; i < sizeof(Buffer); ++i) {
@@ -469,7 +469,7 @@ TEST(SettingsTest, ApplyWithOverwriteReplacesMaxPacingRate)
 
 TEST(SettingsTest, OldSettingsSizeGetDoesNotWriteMaxPacingRate)
 {
-    uint8_t Buffer[sizeof(QUIC_SETTINGS)];
+    alignas(QUIC_SETTINGS) uint8_t Buffer[sizeof(QUIC_SETTINGS)];
     CxPlatZeroMemory(Buffer, sizeof(Buffer));
     const uint32_t OldSize =
         (uint32_t)CXPLAT_STRUCT_SIZE_THRU_FIELD(

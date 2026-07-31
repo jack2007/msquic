@@ -220,6 +220,7 @@ typedef struct QUIC_CONGESTION_CONTROL_BBR {
     //
     // Bounded byte credit for the configured per-connection pacing-rate cap.
     //
+    BOOLEAN RateLimitInitialized;
     uint64_t RateLimitBudgetBytes;
     uint64_t RateLimitRemainderNumerator;
 

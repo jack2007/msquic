@@ -2415,6 +2415,30 @@ TEST_F(BbrTest_DeepTest, RateLimitBootstrapsWithoutBandwidthSample)
     ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
 }
 
+TEST_F(BbrTest_DeepTest, RateLimitBootstrapsAfterServerCreationTimeConfiguration)
+{
+    constexpr uint64_t MaxRates[] = {125, 10000000};
+
+    for (const uint64_t MaxRate : MaxRates) {
+        // Incoming server connections initialize congestion control before
+        // SetConfiguration copies the configuration's connection settings.
+        InitializeWithDefaults(10, 1280, true, false, 0);
+        const uint32_t DatagramPayload =
+            QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+        Connection.Settings.MaxPacingRateBytesPerSecond = MaxRate;
+
+        ASSERT_EQ(
+            DatagramPayload,
+            CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE))
+            << "MaxRate=" << MaxRate;
+        CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+        ASSERT_EQ(
+            0u,
+            CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE))
+            << "MaxRate=" << MaxRate;
+    }
+}
+
 TEST_F(BbrTest_DeepTest, RateLimitLeavesLowerEstimateUnchanged)
 {
     constexpr uint64_t MaxRate = 1000000000;

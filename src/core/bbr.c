@@ -278,6 +278,26 @@ BbrCongestionControlGetEffectivePacingRate(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static void
+BbrCongestionControlInitializeRateLimitBudget(
+    _In_ QUIC_CONGESTION_CONTROL* Cc
+    )
+{
+    QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+    const QUIC_CONNECTION* Connection =
+        QuicCongestionControlGetConnection(Cc);
+    const BOOLEAN RateLimitEnabled =
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
+        Connection->Settings.PacingEnabled;
+
+    Bbr->RateLimitInitialized = RateLimitEnabled;
+    Bbr->RateLimitRemainderNumerator = 0;
+    Bbr->RateLimitBudgetBytes =
+        RateLimitEnabled ?
+            QuicPathGetDatagramPayloadSize(&Connection->Paths[0]) : 0;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 BbrCongestionControlInRecovery(
     _In_ const QUIC_CONGESTION_CONTROL* Cc
@@ -553,6 +573,9 @@ BbrCongestionControlOnDataSent(
     if (
         Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
         Connection->Settings.PacingEnabled) {
+        if (!Bbr->RateLimitInitialized) {
+            BbrCongestionControlInitializeRateLimitBudget(Cc);
+        }
         Bbr->RateLimitBudgetBytes =
             NumRetransmittableBytes >= Bbr->RateLimitBudgetBytes ?
                 0 : Bbr->RateLimitBudgetBytes - NumRetransmittableBytes;
@@ -856,6 +879,10 @@ BbrCongestionControlGetSendAllowance(
         Connection->Settings.MaxPacingRateBytesPerSecond == 0 ||
         !Connection->Settings.PacingEnabled) {
         return SendAllowance;
+    }
+
+    if (!Bbr->RateLimitInitialized) {
+        BbrCongestionControlInitializeRateLimitBudget(Cc);
     }
 
     BbrCongestionControlRefillRateLimitBudget(
@@ -1268,11 +1295,7 @@ BbrCongestionControlReset(
     Bbr->BandwidthFilter.AppLimited = FALSE;
     Bbr->BandwidthFilter.AppLimitedExitTarget = 0;
 
-    Bbr->RateLimitRemainderNumerator = 0;
-    Bbr->RateLimitBudgetBytes =
-        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
-        Connection->Settings.PacingEnabled ?
-            DatagramPayloadLength : 0;
+    BbrCongestionControlInitializeRateLimitBudget(Cc);
 
     BbrCongestionControlLogOutFlowStatus(Cc);
     QuicConnLogBbr(Connection);
@@ -1371,11 +1394,7 @@ BbrCongestionControlInitialize(
         .AppLimitedExitTarget = 0,
     };
 
-    Bbr->RateLimitRemainderNumerator = 0;
-    Bbr->RateLimitBudgetBytes =
-        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
-        Connection->Settings.PacingEnabled ?
-            DatagramPayloadLength : 0;
+    BbrCongestionControlInitializeRateLimitBudget(Cc);
 
     QuicConnLogOutFlowStats(Connection);
     QuicConnLogBbr(Connection);
