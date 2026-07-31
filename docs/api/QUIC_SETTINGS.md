@@ -285,11 +285,17 @@ state. It applies only to BBR with pacing enabled. It does not change BBR's raw
 bandwidth estimate, congestion window, peer behavior, or the QUIC wire
 protocol.
 
-The setting is consumed when a connection is created. Changing a
-Configuration or setting value does not dynamically update an already started
-connection. Normal ack-eliciting traffic is paced with bounded byte credit;
-the first datagram provides bootstrap progress, and later credit is bounded by
-the greater of one datagram and one pacing quantum. ACK-only traffic and
+The setting is consumed when a connection is created. Changing it on a
+Configuration affects only connections that subsequently consume that
+Configuration. A direct `QUIC_PARAM_CONN_SETTINGS` update may set it before the
+connection is started. Once the connection is started, a direct update with
+the `MaxPacingRateBytesPerSecond` `IsSet` bit returns
+`QUIC_STATUS_INVALID_STATE` and does not change the captured value. Direct
+connection-setting updates that omit this bit keep their existing behavior.
+
+Normal ack-eliciting traffic is paced with bounded byte credit; the first
+datagram provides bootstrap progress, and later credit is bounded by the
+greater of one datagram and one pacing quantum. ACK-only traffic and
 congestion-control bypass or recovery traffic are not a hard rate guarantee
 and can cause short bursts above the configured rate.
 

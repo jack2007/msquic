@@ -6530,6 +6530,12 @@ QuicConnParamSet(
             break;
         }
 
+        if (Connection->State.Started &&
+            InternalSettings.IsSet.MaxPacingRateBytesPerSecond) {
+            Status = QUIC_STATUS_INVALID_STATE;
+            break;
+        }
+
         if (!QuicConnApplyNewSettings(
                 Connection,
                 TRUE,

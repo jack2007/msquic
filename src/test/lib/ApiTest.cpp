@@ -4349,6 +4349,164 @@ void QuicTest_QUIC_PARAM_CONN_SETTINGS(MsQuicRegistration& Registration, MsQuicC
                     sizeof(QUIC_SETTINGS),
                     &Settings));
         }
+
+        //
+        // MaxPacingRateBytesPerSecond is a creation-only setting. It can be
+        // set directly before start, but a direct update after start must not
+        // change the value captured by the connection.
+        //
+        {
+            TestScopeLogger LogScope2("Max pacing rate before ConnectionStart");
+            MsQuicConnection Connection(Registration);
+            TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+
+            constexpr uint64_t MaxPacingRate = 1'000'000;
+            QUIC_SETTINGS Settings{0};
+            Settings.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+            Settings.MaxPacingRateBytesPerSecond = MaxPacingRate;
+            TEST_QUIC_SUCCEEDED(
+                Connection.SetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    sizeof(Settings),
+                    &Settings));
+
+            QUIC_SETTINGS AppliedSettings{0};
+            uint32_t AppliedSettingsLength = sizeof(AppliedSettings);
+            TEST_QUIC_SUCCEEDED(
+                Connection.GetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    &AppliedSettingsLength,
+                    &AppliedSettings));
+            TEST_TRUE(AppliedSettings.IsSet.MaxPacingRateBytesPerSecond);
+            TEST_EQUAL(
+                AppliedSettings.MaxPacingRateBytesPerSecond,
+                MaxPacingRate);
+        }
+
+        {
+            TestScopeLogger LogScope2("Max pacing rate after ConnectionStart");
+            constexpr uint64_t ConfiguredMaxPacingRate = 2'000'000;
+            constexpr uint64_t UpdatedMaxPacingRate = 3'000'000;
+            MsQuicSettings ConfigurationSettings;
+            ConfigurationSettings.SetMaxPacingRateBytesPerSecond(
+                ConfiguredMaxPacingRate);
+            MsQuicConfiguration Configuration(
+                Registration,
+                MsQuicAlpn("MsQuicTest"),
+                ConfigurationSettings,
+                MsQuicCredentialConfig());
+            TEST_QUIC_SUCCEEDED(Configuration.GetInitStatus());
+
+            MsQuicConnection Connection(Registration);
+            TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+            TEST_QUIC_SUCCEEDED(
+                Connection.Start(
+                    Configuration,
+                    QUIC_ADDRESS_FAMILY_INET,
+                    QUIC_TEST_LOOPBACK_FOR_AF(QUIC_ADDRESS_FAMILY_INET),
+                    4433));
+            CxPlatSleep(100);
+
+            QUIC_SETTINGS AppliedSettings{0};
+            uint32_t AppliedSettingsLength = sizeof(AppliedSettings);
+            TEST_QUIC_SUCCEEDED(
+                Connection.GetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    &AppliedSettingsLength,
+                    &AppliedSettings));
+            TEST_TRUE(AppliedSettings.IsSet.MaxPacingRateBytesPerSecond);
+            TEST_EQUAL(
+                AppliedSettings.MaxPacingRateBytesPerSecond,
+                ConfiguredMaxPacingRate);
+
+            QUIC_SETTINGS Update{0};
+            Update.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+            Update.MaxPacingRateBytesPerSecond = UpdatedMaxPacingRate;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_STATE,
+                Connection.SetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    sizeof(Update),
+                    &Update));
+
+            AppliedSettings = {};
+            AppliedSettingsLength = sizeof(AppliedSettings);
+            TEST_QUIC_SUCCEEDED(
+                Connection.GetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    &AppliedSettingsLength,
+                    &AppliedSettings));
+            TEST_EQUAL(
+                AppliedSettings.MaxPacingRateBytesPerSecond,
+                ConfiguredMaxPacingRate);
+
+            //
+            // Older, shorter QUIC_SETTINGS inputs and updates which don't set
+            // the new bit retain the existing started-connection behavior.
+            //
+            QUIC_SETTINGS ShortSettings{0};
+            ShortSettings.IsSet.KeepAliveIntervalMs = TRUE;
+            ShortSettings.KeepAliveIntervalMs = 1'000;
+            TEST_QUIC_SUCCEEDED(
+                Connection.SetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    (uint32_t)offsetof(
+                        QUIC_SETTINGS,
+                        MaxPacingRateBytesPerSecond),
+                    &ShortSettings));
+        }
+
+        //
+        // A server connection is already started when the listener applies
+        // its Configuration. This internal creation path must keep accepting
+        // the creation-only setting.
+        //
+        {
+            TestScopeLogger LogScope2("Server ConnectionSetConfiguration");
+            constexpr uint64_t ServerMaxPacingRate = 4'000'000;
+            MsQuicSettings ServerSettings;
+            ServerSettings.SetMaxPacingRateBytesPerSecond(ServerMaxPacingRate);
+            MsQuicConfiguration ServerConfiguration(
+                Registration,
+                MsQuicAlpn("MsQuicTest"),
+                ServerSettings,
+                ServerSelfSignedCredConfig);
+            TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+
+            MsQuicAutoAcceptListener Listener(
+                Registration,
+                ServerConfiguration,
+                MsQuicConnection::NoOpCallback);
+            TEST_QUIC_SUCCEEDED(Listener.GetInitStatus());
+            QuicAddr ServerAddress(QUIC_ADDRESS_FAMILY_INET);
+            TEST_QUIC_SUCCEEDED(
+                Listener.Start(MsQuicAlpn("MsQuicTest"), ServerAddress));
+            TEST_QUIC_SUCCEEDED(Listener.GetLocalAddr(ServerAddress));
+
+            MsQuicConnection Client(Registration);
+            TEST_QUIC_SUCCEEDED(Client.GetInitStatus());
+            TEST_QUIC_SUCCEEDED(
+                Client.Start(
+                    ClientConfiguration,
+                    ServerAddress.GetFamily(),
+                    QUIC_TEST_LOOPBACK_FOR_AF(ServerAddress.GetFamily()),
+                    ServerAddress.GetPort()));
+            Client.HandshakeCompleteEvent.WaitForever();
+            TEST_TRUE(Client.HandshakeComplete);
+            TEST_NOT_EQUAL(nullptr, Listener.LastConnection);
+
+            QUIC_SETTINGS AppliedSettings{0};
+            uint32_t AppliedSettingsLength = sizeof(AppliedSettings);
+            TEST_QUIC_SUCCEEDED(
+                Listener.LastConnection->GetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    &AppliedSettingsLength,
+                    &AppliedSettings));
+            TEST_TRUE(AppliedSettings.IsSet.MaxPacingRateBytesPerSecond);
+            TEST_EQUAL(
+                AppliedSettings.MaxPacingRateBytesPerSecond,
+                ServerMaxPacingRate);
+        }
     }
 
     //

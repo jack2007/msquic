@@ -473,7 +473,9 @@ Raw BBR bandwidth estimate, in bytes per second. This value is not clamped by
 `MaxPacingRateBytesPerSecond`
 
 Configured maximum pacing rate for the local sender on this connection, in
-bytes per second. Zero means that no maximum is configured.
+bytes per second. Zero means that no maximum is configured. This is the value
+captured when the new connection consumes its Configuration or pre-start
+connection settings; it is not a live view of later Configuration changes.
 
 `EffectivePacingRateBytesPerSecond`
 

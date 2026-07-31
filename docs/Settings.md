@@ -125,12 +125,20 @@ limit. The limit is per connection and per direction. It does not aggregate
 across connections or configure the peer.
 
 The setting is consumed when the connection is created and is not hot-applied
-to an already started connection. It affects only BBR when pacing is enabled,
-without clamping the raw BBR bandwidth estimate, changing the congestion
-window, changing peer behavior, or changing the wire protocol. The paced data
-path uses bounded byte credit and starts with one bootstrap datagram. ACK-only
-traffic and congestion-control bypass or recovery traffic can produce short
-bursts, so this is a soft pacing limit rather than a hard on-wire shaper.
+to an already started connection. Changing it on a Configuration affects only
+connections that subsequently consume that Configuration. A direct
+`QUIC_PARAM_CONN_SETTINGS` update may set it before the connection is started;
+after start, a direct update with its `IsSet` bit returns
+`QUIC_STATUS_INVALID_STATE` and leaves the captured value unchanged. Other
+connection-setting updates that do not set this bit retain their existing
+behavior.
+
+The limit affects only BBR when pacing is enabled, without clamping the raw BBR
+bandwidth estimate, changing the congestion window, changing peer behavior, or
+changing the wire protocol. The paced data path uses bounded byte credit and
+starts with one bootstrap datagram. ACK-only traffic and congestion-control
+bypass or recovery traffic can produce short bursts, so this is a soft pacing
+limit rather than a hard on-wire shaper.
 
 The preview `QUIC_NETWORK_STATISTICS` reports three separate byte-per-second
 values: raw `Bandwidth`, configured `MaxPacingRateBytesPerSecond`, and
