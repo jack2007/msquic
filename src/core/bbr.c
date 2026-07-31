@@ -773,6 +773,9 @@ BbrCongestionControlRefillRateLimitBudget(
 
     const uint64_t EffectiveRate =
         BbrCongestionControlGetEffectivePacingRate(Cc);
+    if (EffectiveRate == 0) {
+        return;
+    }
     const uint64_t MissingBytes =
         BurstCapacity - Bbr->RateLimitBudgetBytes;
     const uint64_t NumeratorNeeded =

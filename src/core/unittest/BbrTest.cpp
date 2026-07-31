@@ -2319,23 +2319,85 @@ TEST_F(BbrTest_DeepTest, SetExemption_Zero)
 
 TEST_F(BbrTest_DeepTest, RateLimitZeroPreservesAllowance)
 {
-    InitializeWithDefaults(10, 1280, true, false, 0);
+    constexpr uint32_t WindowPackets = 10;
+    constexpr uint16_t Mtu = 1280;
+    InitializeWithDefaults(WindowPackets, Mtu, true, false, 0);
+
+    QUIC_CONNECTION UnlimitedConnection{};
+    QUIC_SETTINGS_INTERNAL UnlimitedSettings{};
+    UnlimitedSettings.InitialWindowPackets = WindowPackets;
+    UnlimitedSettings.MaxPacingRateBytesPerSecond = 0;
+    InitBbrMockConnection(UnlimitedConnection, Mtu);
+    UnlimitedConnection.Settings.PacingEnabled = TRUE;
+    UnlimitedConnection.Settings.MaxPacingRateBytesPerSecond = 0;
+    QUIC_CONGESTION_CONTROL* UnlimitedCc =
+        &UnlimitedConnection.CongestionControl;
+    BbrCongestionControlInitialize(UnlimitedCc, &UnlimitedSettings);
+
     const uint64_t BudgetSentinel = 0x123456789abcdef0ULL;
     const uint64_t RemainderSentinel = 777777;
     Bbr->RateLimitBudgetBytes = BudgetSentinel;
     Bbr->RateLimitRemainderNumerator = RemainderSentinel;
 
-    const uint32_t First =
-        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE);
-    const uint32_t ExpectedFirst = Bbr->CongestionWindow - Bbr->BytesInFlight;
-    ASSERT_EQ(ExpectedFirst, First);
+    auto CompareAllowance = [this, UnlimitedCc](
+        uint64_t TimeSinceLastSend,
+        BOOLEAN TimeSinceLastSendValid) {
+        ASSERT_EQ(
+            UnlimitedCc->QuicCongestionControlGetSendAllowance(
+                UnlimitedCc, TimeSinceLastSend, TimeSinceLastSendValid),
+            CC->QuicCongestionControlGetSendAllowance(
+                CC, TimeSinceLastSend, TimeSinceLastSendValid));
+    };
+    auto PumpIdenticalBandwidthAndRttSample = [](
+        QUIC_CONGESTION_CONTROL* TargetCc) {
+        constexpr uint64_t TimeNow = 1050000;
+        constexpr uint64_t MinRtt = 45000;
+        constexpr uint32_t BytesAcked = 1200;
+        constexpr uint64_t SendElapsedUs = 12000;
+        auto PacketBuf = MakeBbrPacket(
+            BytesAcked, TRUE, FALSE,
+            10000 + BytesAcked, TimeNow - MinRtt,
+            10000, TimeNow - MinRtt - SendElapsedUs,
+            0, TimeNow - SendElapsedUs, TimeNow - SendElapsedUs);
+        auto& Packet = PacketBuf.Metadata;
+
+        TargetCc->QuicCongestionControlOnDataSent(TargetCc, BytesAcked);
+        QUIC_ACK_EVENT Ack = MakeBbrAckEvent(
+            TimeNow, 1, 2, BytesAcked, 50000, MinRtt, TRUE);
+        Ack.AckedPackets = &Packet;
+        Ack.IsLargestAckedPacketAppLimited = FALSE;
+        TargetCc->QuicCongestionControlOnDataAcknowledged(TargetCc, &Ack);
+    };
+
+    CompareAllowance(0, FALSE);
+    ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
+
+    PumpIdenticalBandwidthAndRttSample(CC);
+    PumpIdenticalBandwidthAndRttSample(UnlimitedCc);
+    ASSERT_EQ(
+        BbrCongestionControlGetBandwidth(UnlimitedCc),
+        BbrCongestionControlGetBandwidth(CC));
+    ASSERT_EQ(UnlimitedCc->Bbr.MinRtt, Bbr->MinRtt);
+    ASSERT_EQ(UnlimitedCc->Bbr.BbrState, Bbr->BbrState);
+    ASSERT_EQ((uint32_t)BBR_STATE_STARTUP, Bbr->BbrState);
+    CompareAllowance(10000, TRUE);
+    ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
+
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    UnlimitedCc->Bbr.BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingCycleIndex = 0;
+    UnlimitedCc->Bbr.PacingCycleIndex = 0;
+    Bbr->PacingGain = 320;
+    UnlimitedCc->Bbr.PacingGain = 320;
+    CompareAllowance(10000, TRUE);
     ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
     ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
 
     CC->QuicCongestionControlOnDataSent(CC, 200);
-    const uint32_t Second =
-        CC->QuicCongestionControlGetSendAllowance(CC, 500, TRUE);
-    ASSERT_EQ(Bbr->CongestionWindow - Bbr->BytesInFlight, Second);
+    UnlimitedCc->QuicCongestionControlOnDataSent(UnlimitedCc, 200);
+    CompareAllowance(500, TRUE);
     ASSERT_EQ(BudgetSentinel, Bbr->RateLimitBudgetBytes);
     ASSERT_EQ(RemainderSentinel, Bbr->RateLimitRemainderNumerator);
 }
@@ -2533,6 +2595,27 @@ TEST_F(BbrTest_DeepTest, RateLimitCcExemptionStillMakesProgress)
             CC,
             ((uint64_t)DatagramPayload * 1000000ULL + MaxRate - 1) / MaxRate,
             TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitZeroEffectiveRateDoesNotRefill)
+{
+    InitializeWithDefaults(10, 1280, true, false, 125);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    QuicSlidingWindowExtremumUpdateMax(
+        &Bbr->BandwidthFilter.WindowedMaxFilter, 8, 1); // Raw BW_UNIT = 1 B/s.
+    Bbr->PacingGain = 192; // ProbeBW 0.75 gain floors the effective rate to zero.
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    ASSERT_EQ(1u, Stats.Bandwidth);
+    ASSERT_EQ(0u, Stats.EffectivePacingRateBytesPerSecond);
+
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    ASSERT_EQ(
+        0u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE));
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
 }
 
 TEST_F(BbrTest_DeepTest, RateLimitArithmeticSaturatesSafely)
