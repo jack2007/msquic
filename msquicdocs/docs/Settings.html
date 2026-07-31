@@ -525,6 +525,29 @@ Generally MsQuic already choses the best / most correct default values for all s
 <h2 id="quic_settings">QUIC_SETTINGS</h2>
 <p>A <a href="api/QUIC_SETTINGS.html">QUIC_SETTINGS</a> struct is used to configure settings on a <code>Configuration</code> handle, <code>Connection</code> handle, or globally.</p>
 <p>For more details see <a href="api/QUIC_SETTINGS.html">QUIC_SETTINGS</a>.</p>
+<h3 id="fork-specific-maximum-bbr-pacing-rate">Fork-specific maximum BBR pacing rate</h3>
+<p>This fork appends <code>MaxPacingRateBytesPerSecond</code> to <code>QUIC_SETTINGS</code> and assigns
+it <code>IsSet</code> bit 46. A nonzero value limits the effective pacing rate of the
+local BBR sender on each connection, in bytes per second; zero disables the
+limit. The limit is per connection and per direction. It does not aggregate
+across connections or configure the peer.</p>
+<p>The setting is consumed when the connection is created and is not hot-applied
+to an already started connection. Changing it on a Configuration affects only
+connections that subsequently consume that Configuration. A direct
+<code>QUIC_PARAM_CONN_SETTINGS</code> update may set it before the connection is started;
+after start, a direct update with its <code>IsSet</code> bit returns
+<code>QUIC_STATUS_INVALID_STATE</code> and leaves the captured value unchanged. Other
+connection-setting updates that do not set this bit retain their existing
+behavior.</p>
+<p>The limit affects only BBR when pacing is enabled, without clamping the raw BBR
+bandwidth estimate, changing the congestion window, changing peer behavior, or
+changing the wire protocol. The paced data path uses bounded byte credit and
+starts with one bootstrap datagram. ACK-only traffic and congestion-control
+bypass or recovery traffic can produce short bursts, so this is a soft pacing
+limit rather than a hard on-wire shaper.</p>
+<p>The preview <code>QUIC_NETWORK_STATISTICS</code> reports three separate byte-per-second
+values: raw <code>Bandwidth</code>, configured <code>MaxPacingRateBytesPerSecond</code>, and
+post-limit <code>EffectivePacingRateBytesPerSecond</code>.</p>
 <h1 id="api-object-parameters">API Object Parameters</h1>
 <p>MsQuic API Objects have a number of settings, or parameters, which can be queried via <a href="api/GetParam.html">GetParam</a>, or can be set/modifed via <a href="api/SetParam.html">SetParam</a>.</p>
 <h2 id="global-parameters">Global Parameters</h2>
