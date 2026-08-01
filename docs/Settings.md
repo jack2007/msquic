@@ -116,33 +116,45 @@ A [QUIC_SETTINGS](./api/QUIC_SETTINGS.md) struct is used to configure settings o
 
 For more details see [QUIC_SETTINGS](./api/QUIC_SETTINGS.md).
 
-### Fork-specific maximum BBR pacing rate
+### Fork-specific BBR pacing rate bounds
 
-This fork appends `MaxPacingRateBytesPerSecond` to `QUIC_SETTINGS` and assigns
-it `IsSet` bit 46. A nonzero value limits the effective pacing rate of the
-local BBR sender on each connection, in bytes per second; zero disables the
-limit. The limit is per connection and per direction. It does not aggregate
-across connections or configure the peer.
+本 fork 在 `QUIC_SETTINGS` 尾部依次追加
+`MaxPacingRateBytesPerSecond`（`IsSet` bit 46）和
+`MinPacingRateBytesPerSecond`（`IsSet` bit 47）。两者单位均为 bytes/s：max 为
+`0` 时禁用 soft cap，min 为 `0` 时禁用 soft pacing floor。当两者均非零时，
+`MinPacingRateBytesPerSecond` 必须小于或等于
+`MaxPacingRateBytesPerSecond`。
 
-The setting is consumed when the connection is created and is not hot-applied
-to an already started connection. Changing it on a Configuration affects only
-connections that subsequently consume that Configuration. A direct
-`QUIC_PARAM_CONN_SETTINGS` update may set it before the connection is started;
-after start, a direct update with its `IsSet` bit returns
-`QUIC_STATUS_INVALID_STATE` and leaves the captured value unchanged. Other
-connection-setting updates that do not set this bit retain their existing
-behavior.
+两字段是 per-connection、local-send、directional 设置；每个 endpoint 只约束自己
+的 sender，不会聚合多个连接，也不会配置 peer。Configuration 上的变更只影响
+之后使用该 Configuration 的连接。对具体 connection 使用
+`QUIC_PARAM_CONN_SETTINGS` 时，启动前和已启动的 BBR 连接（started BBR connection）
+都可以设置 min/max。活动 BBR 上成功更新后，MsQuic 会立即刷新其
+pacing 状态并请求一次 send flush。
 
-The limit affects only BBR when pacing is enabled, without clamping the raw BBR
-bandwidth estimate, changing the congestion window, changing peer behavior, or
-changing the wire protocol. The paced data path uses bounded byte credit and
-starts with one bootstrap datagram. ACK-only traffic and congestion-control
-bypass or recovery traffic can produce short bursts, so this is a soft pacing
-limit rather than a hard on-wire shaper.
+部分更新会与连接当前的另一侧边界合并成候选 min/max，并在写入任何一侧之前完成
+原子校验。双非零且 min 大于 max 时，`SetParam` 返回
+`QUIC_STATUS_INVALID_PARAMETER`，旧 min/max 都不改变。未设置相应 `IsSet` bit 的
+字段不会参与本次覆盖。
 
-The preview `QUIC_NETWORK_STATISTICS` reports three separate byte-per-second
-values: raw `Bandwidth`, configured `MaxPacingRateBytesPerSecond`, and
-post-limit `EffectivePacingRateBytesPerSecond`.
+边界只在 BBR 且 pacing enabled 时生效。max 使用有界 byte credit，因此仍允许
+bootstrap、ACK-only 或 recovery/bypass traffic 的短时突发；min 只提高基于时间的
+pacing allowance，不能绕过 congestion/recovery window、bytes in flight 或 flow
+control。应用供数和实际链路能力仍然是限制条件，所以 min 是 soft pacing floor，
+不是吞吐 SLA。两者都不修改 raw BBR bandwidth estimator、cwnd、BBR state、peer
+behavior 或 wire protocol。
+
+preview `QUIC_NETWORK_STATISTICS` 区分四个值：raw `Bandwidth`、configured
+`MinPacingRateBytesPerSecond`、configured `MaxPacingRateBytesPerSecond`，以及应用
+边界后的 `EffectivePacingRateBytesPerSecond`。min 追加在结构尾部：使用
+`QUIC_NETWORK_STATISTICS_SIZE_1` 的旧调用方仍只读取到 effective 字段，使用
+`QUIC_NETWORK_STATISTICS_SIZE_2` 或完整结构大小的调用方才读取 min。
+
+本次 fork 的 binding 范围只包括 C public header `msquic.h` 和 C++ wrapper
+`msquic.hpp`（提供 `SetMinPacingRateBytesPerSecond()` 与
+`SetMaxPacingRateBytesPerSecond()`）。仓库内 Rust bindgen 输出和 C# generated
+bindings 未更新，也不在本接口承诺范围内；使用这些 binding 的调用方不能假定新
+字段已经可用。
 
 # API Object Parameters
 

@@ -59,11 +59,13 @@ typedef struct QUIC_SETTINGS {
             uint64_t QTIPEnabled                            : 1;
             uint64_t ReservedRioEnabled                     : 1;
             uint64_t MaxPacingRateBytesPerSecond            : 1;
-            uint64_t RESERVED                               : 17;
+            uint64_t MinPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 16;
 #else
             uint64_t RESERVED_PREVIEW                       : 8;
             uint64_t MaxPacingRateBytesPerSecond            : 1;
-            uint64_t RESERVED                               : 17;
+            uint64_t MinPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 16;
 #endif
         } IsSet;
     };
@@ -125,6 +127,7 @@ typedef struct QUIC_SETTINGS {
     uint32_t StreamRecvWindowBidiRemoteDefault;
     uint32_t StreamRecvWindowUnidiDefault;
     uint64_t MaxPacingRateBytesPerSecond;
+    uint64_t MinPacingRateBytesPerSecond;
 
 } QUIC_SETTINGS;
 ```
@@ -275,31 +278,43 @@ Pace sending to avoid overfilling buffers on the path.
 
 `MaxPacingRateBytesPerSecond`
 
-Limits the effective pacing rate of the local BBR sender for each connection,
-in bytes per second. Set the corresponding `IsSet` bit (bit 46) when supplying
-the value. Zero disables the limit.
-
-The limit is local and directional: each endpoint independently limits only
-its own sender, and every connection has a separate limit and byte-credit
-state. It applies only to BBR with pacing enabled. It does not change BBR's raw
-bandwidth estimate, congestion window, peer behavior, or the QUIC wire
-protocol.
-
-The setting is consumed when a connection is created. Changing it on a
-Configuration affects only connections that subsequently consume that
-Configuration. A direct `QUIC_PARAM_CONN_SETTINGS` update may set it before the
-connection is started. Once the connection is started, a direct update with
-the `MaxPacingRateBytesPerSecond` `IsSet` bit returns
-`QUIC_STATUS_INVALID_STATE` and does not change the captured value. Direct
-connection-setting updates that omit this bit keep their existing behavior.
-
-Normal ack-eliciting traffic is paced with bounded byte credit; the first
-datagram provides bootstrap progress, and later credit is bounded by the
-greater of one datagram and one pacing quantum. ACK-only traffic and
-congestion-control bypass or recovery traffic are not a hard rate guarantee
-and can cause short bursts above the configured rate.
+本连接本端 BBR sender 的最大 pacing rate，单位为 bytes/s。提供该值时应设置
+对应的 `IsSet` bit（bit 46）；值为 `0` 表示禁用 soft cap。非零上限通过有界
+byte credit 控制正常 ack-eliciting traffic；bootstrap datagram、ACK-only traffic
+以及 congestion-control bypass/recovery traffic 仍可能形成短时突发，因此它不是
+严格的 on-wire shaper。
 
 **Default value:** 0 (disabled)
+
+`MinPacingRateBytesPerSecond`
+
+本连接本端 BBR sender 的最小 pacing rate，单位为 bytes/s。提供该值时应设置
+对应的 `IsSet` bit（bit 47）；值为 `0` 表示禁用 soft pacing floor。该下限只提高
+基于时间计算的 pacing allowance，不会提高 congestion/recovery window，不会绕过
+bytes in flight、congestion control 或 flow control，也不能保证应用供数不足或链路
+受限时的实际吞吐。
+
+**Default value:** 0 (disabled)
+
+当 `MinPacingRateBytesPerSecond` 和 `MaxPacingRateBytesPerSecond` 均非零时，min
+必须小于或等于 max。`QUIC_PARAM_CONN_SETTINGS` 会先把本次设置的字段与连接当前的
+另一侧边界合并，再原子校验候选 min/max；非法组合返回
+`QUIC_STATUS_INVALID_PARAMETER`，原有 min/max 保持不变。单字段更新也遵循同一
+规则。
+
+两字段均可在连接启动前设置，也可通过 `QUIC_PARAM_CONN_SETTINGS` 更新已启动的
+BBR 连接（started BBR connection）。更新活动 BBR 连接时，新的边界会立即刷新
+pacing 状态并请求一次 send flush；修改 Configuration 仍只影响之后使用该
+Configuration 的连接。
+
+min/max 均为 per-connection、local-send、directional 设置，各端独立配置，不会
+聚合多个连接，也不会配置 peer。它们只在 BBR 且 pacing enabled 时参与 pacing
+计算，不会修改原始 BBR bandwidth estimator、cwnd、peer behavior 或 QUIC wire
+protocol。
+
+`MinPacingRateBytesPerSecond` 追加在 `QUIC_SETTINGS` 尾部。只包含到
+`MaxPacingRateBytesPerSecond` 的旧 size 仍可按原语义 set/get max；size-aware copy
+不会读取或写入 min，也不会越过调用方 buffer。
 
 `MigrationEnabled`
 
