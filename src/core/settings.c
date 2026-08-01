@@ -168,6 +168,9 @@ QuicSettingsSetDefault(
     if (!Settings->IsSet.MaxPacingRateBytesPerSecond) {
         Settings->MaxPacingRateBytesPerSecond = 0;
     }
+    if (!Settings->IsSet.MinPacingRateBytesPerSecond) {
+        Settings->MinPacingRateBytesPerSecond = 0;
+    }
     if (!Settings->IsSet.OneWayDelayEnabled) {
         Settings->OneWayDelayEnabled = QUIC_DEFAULT_ONE_WAY_DELAY_ENABLED;
     }
@@ -346,6 +349,10 @@ QuicSettingsCopy(
         Destination->MaxPacingRateBytesPerSecond =
             Source->MaxPacingRateBytesPerSecond;
     }
+    if (!Destination->IsSet.MinPacingRateBytesPerSecond) {
+        Destination->MinPacingRateBytesPerSecond =
+            Source->MinPacingRateBytesPerSecond;
+    }
     if (!Destination->IsSet.OneWayDelayEnabled) {
         Destination->OneWayDelayEnabled = Source->OneWayDelayEnabled;
     }
@@ -433,6 +440,20 @@ QuicSettingApply(
         const QUIC_SETTINGS_INTERNAL* Source
     )
 {
+    uint64_t CandidateMin = Destination->MinPacingRateBytesPerSecond;
+    uint64_t CandidateMax = Destination->MaxPacingRateBytesPerSecond;
+    if (Source->IsSet.MinPacingRateBytesPerSecond &&
+        (!Destination->IsSet.MinPacingRateBytesPerSecond || OverWrite)) {
+        CandidateMin = Source->MinPacingRateBytesPerSecond;
+    }
+    if (Source->IsSet.MaxPacingRateBytesPerSecond &&
+        (!Destination->IsSet.MaxPacingRateBytesPerSecond || OverWrite)) {
+        CandidateMax = Source->MaxPacingRateBytesPerSecond;
+    }
+    if (CandidateMin != 0 && CandidateMax != 0 && CandidateMin > CandidateMax) {
+        return FALSE;
+    }
+
     if (Source->IsSet.SendBufferingEnabled && (!Destination->IsSet.SendBufferingEnabled || OverWrite)) {
         Destination->SendBufferingEnabled = Source->SendBufferingEnabled;
         Destination->IsSet.SendBufferingEnabled = TRUE;
@@ -746,6 +767,12 @@ QuicSettingApply(
         Destination->MaxPacingRateBytesPerSecond =
             Source->MaxPacingRateBytesPerSecond;
         Destination->IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    }
+    if (Source->IsSet.MinPacingRateBytesPerSecond &&
+        (!Destination->IsSet.MinPacingRateBytesPerSecond || OverWrite)) {
+        Destination->MinPacingRateBytesPerSecond =
+            Source->MinPacingRateBytesPerSecond;
+        Destination->IsSet.MinPacingRateBytesPerSecond = TRUE;
     }
 
 
@@ -1520,6 +1547,7 @@ QuicSettingsDump(
     QuicTraceLogVerbose(SettingXdpEnabled,                  "[sett] XdpEnabled             = %hhu", Settings->XdpEnabled);
     QuicTraceLogVerbose(SettingQTIPEnabled,                 "[sett] QTIPEnabled            = %hhu", Settings->QTIPEnabled);
     QuicTraceLogVerbose(SettingMaxPacingRateBytesPerSecond, "[sett] MaxPacingRateBytesPerSecond=%llu", Settings->MaxPacingRateBytesPerSecond);
+    QuicTraceLogVerbose(SettingMinPacingRateBytesPerSecond, "[sett] MinPacingRateBytesPerSecond=%llu", Settings->MinPacingRateBytesPerSecond);
     QuicTraceLogVerbose(SettingOneWayDelayEnabled,          "[sett] OneWayDelayEnabled     = %hhu", Settings->OneWayDelayEnabled);
     QuicTraceLogVerbose(SettingNetStatsEventEnabled,        "[sett] NetStatsEventEnabled   = %hhu", Settings->NetStatsEventEnabled);
     QuicTraceLogVerbose(SettingsStreamMultiReceiveEnabled,  "[sett] StreamMultiReceiveEnabled= %hhu", Settings->StreamMultiReceiveEnabled);
@@ -1686,6 +1714,9 @@ QuicSettingsDumpNew(
     }
     if (Settings->IsSet.MaxPacingRateBytesPerSecond) {
         QuicTraceLogVerbose(SettingMaxPacingRateBytesPerSecond,     "[sett] MaxPacingRateBytesPerSecond=%llu", Settings->MaxPacingRateBytesPerSecond);
+    }
+    if (Settings->IsSet.MinPacingRateBytesPerSecond) {
+        QuicTraceLogVerbose(SettingMinPacingRateBytesPerSecond,     "[sett] MinPacingRateBytesPerSecond=%llu", Settings->MinPacingRateBytesPerSecond);
     }
     if (Settings->IsSet.OneWayDelayEnabled) {
         QuicTraceLogVerbose(SettingOneWayDelayEnabled,              "[sett] OneWayDelayEnabled         = %hhu", Settings->OneWayDelayEnabled);
@@ -1977,6 +2008,13 @@ QuicSettingsSettingsToInternal(
         SettingsSize,
         InternalSettings);
 
+    SETTING_COPY_TO_INTERNAL_SIZED(
+        MinPacingRateBytesPerSecond,
+        QUIC_SETTINGS,
+        Settings,
+        SettingsSize,
+        InternalSettings);
+
     return QUIC_STATUS_SUCCESS;
 }
 
@@ -2164,6 +2202,13 @@ QuicSettingsGetSettings(
 
     SETTING_COPY_FROM_INTERNAL_SIZED(
         MaxPacingRateBytesPerSecond,
+        QUIC_SETTINGS,
+        Settings,
+        *SettingsLength,
+        InternalSettings);
+
+    SETTING_COPY_FROM_INTERNAL_SIZED(
+        MinPacingRateBytesPerSecond,
         QUIC_SETTINGS,
         Settings,
         *SettingsLength,

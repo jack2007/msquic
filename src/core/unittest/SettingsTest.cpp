@@ -130,6 +130,7 @@ TEST(SettingsTest, TestAllSettingsFieldsSet)
     SETTINGS_FEATURE_SET_TEST(NetStatsEventEnabled, QuicSettingsSettingsToInternal);
     SETTINGS_FEATURE_SET_TEST(StreamMultiReceiveEnabled, QuicSettingsSettingsToInternal);
     SETTINGS_FEATURE_SET_TEST(MaxPacingRateBytesPerSecond, QuicSettingsSettingsToInternal);
+    SETTINGS_FEATURE_SET_TEST(MinPacingRateBytesPerSecond, QuicSettingsSettingsToInternal);
 
     // Bias field count on behalf of erstwhile ReservedRioEnabled
     FieldCount++;
@@ -146,6 +147,10 @@ TEST(SettingsTest, TestAllSettingsFieldsSet)
     Settings.IsSetFlags = 0;
     Settings.IsSet.MaxPacingRateBytesPerSecond = TRUE;
     ASSERT_EQ((1ull << 46), Settings.IsSetFlags);
+
+    Settings.IsSetFlags = 0;
+    Settings.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    ASSERT_EQ((1ull << 47), Settings.IsSetFlags);
 }
 
 TEST(SettingsTest, TestAllGlobalSettingsFieldsSet)
@@ -231,6 +236,7 @@ TEST(SettingsTest, TestAllSettingsFieldsGet)
     SETTINGS_FEATURE_GET_TEST(NetStatsEventEnabled, QuicSettingsGetSettings);
     SETTINGS_FEATURE_GET_TEST(StreamMultiReceiveEnabled, QuicSettingsGetSettings);
     SETTINGS_FEATURE_GET_TEST(MaxPacingRateBytesPerSecond, QuicSettingsGetSettings);
+    SETTINGS_FEATURE_GET_TEST(MinPacingRateBytesPerSecond, QuicSettingsGetSettings);
 
     // Bias field count on behalf of erstwhile ReservedRioEnabled
     FieldCount++;
@@ -247,6 +253,10 @@ TEST(SettingsTest, TestAllSettingsFieldsGet)
     Settings.IsSetFlags = 0;
     Settings.IsSet.MaxPacingRateBytesPerSecond = TRUE;
     ASSERT_EQ((1ull << 46), Settings.IsSetFlags);
+
+    Settings.IsSetFlags = 0;
+    Settings.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    ASSERT_EQ((1ull << 47), Settings.IsSetFlags);
 }
 
 TEST(SettingsTest, TestAllGlobalSettingsFieldsGet)
@@ -388,6 +398,14 @@ TEST(SettingsTest, MaxPacingRateDefaultsToUnlimited)
     ASSERT_EQ(0u, Settings.MaxPacingRateBytesPerSecond);
 }
 
+TEST(SettingsTest, PacingRateBoundsDefaultToDisabled)
+{
+    QUIC_SETTINGS_INTERNAL Settings{};
+    QuicSettingsSetDefault(&Settings);
+    ASSERT_EQ(0u, Settings.MinPacingRateBytesPerSecond);
+    ASSERT_EQ(0u, Settings.MaxPacingRateBytesPerSecond);
+}
+
 TEST(SettingsTest, OldSettingsSizeDoesNotRequireMaxPacingRate)
 {
     const uint32_t OldSize =
@@ -426,6 +444,17 @@ TEST(SettingsTest, MaxPacingRateIsInheritedFromParent)
     ASSERT_EQ(1234u, Child.MaxPacingRateBytesPerSecond);
 }
 
+TEST(SettingsTest, MinPacingRateIsInheritedFromParent)
+{
+    QUIC_SETTINGS_INTERNAL Parent{};
+    QUIC_SETTINGS_INTERNAL Child{};
+    Parent.MinPacingRateBytesPerSecond = 1234;
+
+    QuicSettingsCopy(&Child, &Parent);
+
+    ASSERT_EQ(1234u, Child.MinPacingRateBytesPerSecond);
+}
+
 TEST(SettingsTest, ExplicitUnlimitedMaxPacingRateOverridesParent)
 {
     QUIC_SETTINGS_INTERNAL Parent{};
@@ -437,6 +466,19 @@ TEST(SettingsTest, ExplicitUnlimitedMaxPacingRateOverridesParent)
     QuicSettingsCopy(&Child, &Parent);
 
     ASSERT_EQ(0u, Child.MaxPacingRateBytesPerSecond);
+}
+
+TEST(SettingsTest, ExplicitDisabledMinPacingRateOverridesParent)
+{
+    QUIC_SETTINGS_INTERNAL Parent{};
+    QUIC_SETTINGS_INTERNAL Child{};
+    Parent.MinPacingRateBytesPerSecond = 1234;
+    Child.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Child.MinPacingRateBytesPerSecond = 0;
+
+    QuicSettingsCopy(&Child, &Parent);
+
+    ASSERT_EQ(0u, Child.MinPacingRateBytesPerSecond);
 }
 
 TEST(SettingsTest, ApplyWithoutOverwriteKeepsMaxPacingRate)
@@ -467,6 +509,127 @@ TEST(SettingsTest, ApplyWithOverwriteReplacesMaxPacingRate)
     ASSERT_EQ(5678u, Destination.MaxPacingRateBytesPerSecond);
 }
 
+TEST(SettingsTest, ApplyWithoutOverwriteKeepsMinPacingRate)
+{
+    QUIC_SETTINGS_INTERNAL Source{};
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Source.MinPacingRateBytesPerSecond = 5678;
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 1234;
+
+    ASSERT_TRUE(QuicSettingApply(&Destination, FALSE, TRUE, &Source));
+
+    ASSERT_EQ(1234u, Destination.MinPacingRateBytesPerSecond);
+}
+
+TEST(SettingsTest, ApplyWithOverwriteReplacesMinPacingRate)
+{
+    QUIC_SETTINGS_INTERNAL Source{};
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Source.MinPacingRateBytesPerSecond = 5678;
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 1234;
+
+    ASSERT_TRUE(QuicSettingApply(&Destination, TRUE, TRUE, &Source));
+
+    ASSERT_EQ(5678u, Destination.MinPacingRateBytesPerSecond);
+}
+
+TEST(SettingsTest, PacingRateBoundsValidateMergedCandidate)
+{
+    struct TestCase {
+        uint64_t Min;
+        uint64_t Max;
+        BOOLEAN Expected;
+    } Tests[] = {
+        {0, 0, TRUE},
+        {1, 0, TRUE},
+        {0, 1, TRUE},
+        {1, 1, TRUE},
+        {2, 1, FALSE},
+    };
+
+    for (const auto& Test : Tests) {
+        SCOPED_TRACE(
+            testing::Message() << "min=" << Test.Min << ", max=" << Test.Max);
+        QUIC_SETTINGS_INTERNAL Destination{};
+        QUIC_SETTINGS_INTERNAL Source{};
+        Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+        Source.MinPacingRateBytesPerSecond = Test.Min;
+        Source.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+        Source.MaxPacingRateBytesPerSecond = Test.Max;
+
+        ASSERT_EQ(Test.Expected, QuicSettingApply(&Destination, TRUE, TRUE, &Source));
+        if (Test.Expected) {
+            ASSERT_EQ(Test.Min, Destination.MinPacingRateBytesPerSecond);
+            ASSERT_EQ(Test.Max, Destination.MaxPacingRateBytesPerSecond);
+        }
+    }
+}
+
+TEST(SettingsTest, PacingRateBoundsRejectInvalidMergedCandidateAtomically)
+{
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Destination.IsSet.PacingEnabled = TRUE;
+    Destination.PacingEnabled = FALSE;
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 1000;
+    Destination.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    Destination.MaxPacingRateBytesPerSecond = 2000;
+    const QUIC_SETTINGS_INTERNAL Original = Destination;
+
+    QUIC_SETTINGS_INTERNAL Source{};
+    Source.IsSet.PacingEnabled = TRUE;
+    Source.PacingEnabled = TRUE;
+    Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Source.MinPacingRateBytesPerSecond = 3000;
+
+    ASSERT_FALSE(QuicSettingApply(&Destination, TRUE, TRUE, &Source));
+    ASSERT_EQ(
+        0,
+        memcmp(&Original, &Destination, sizeof(QUIC_SETTINGS_INTERNAL)));
+}
+
+TEST(SettingsTest, PacingRateBoundsValidatePartialMinAgainstCurrentMax)
+{
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 1000;
+    Destination.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    Destination.MaxPacingRateBytesPerSecond = 2000;
+    const QUIC_SETTINGS_INTERNAL Original = Destination;
+
+    QUIC_SETTINGS_INTERNAL Source{};
+    Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Source.MinPacingRateBytesPerSecond = 3000;
+
+    ASSERT_FALSE(QuicSettingApply(&Destination, TRUE, TRUE, &Source));
+    ASSERT_EQ(
+        0,
+        memcmp(&Original, &Destination, sizeof(QUIC_SETTINGS_INTERNAL)));
+}
+
+TEST(SettingsTest, PacingRateBoundsValidatePartialMaxAgainstCurrentMin)
+{
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 2000;
+    Destination.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    Destination.MaxPacingRateBytesPerSecond = 3000;
+    const QUIC_SETTINGS_INTERNAL Original = Destination;
+
+    QUIC_SETTINGS_INTERNAL Source{};
+    Source.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    Source.MaxPacingRateBytesPerSecond = 1000;
+
+    ASSERT_FALSE(QuicSettingApply(&Destination, TRUE, TRUE, &Source));
+    ASSERT_EQ(
+        0,
+        memcmp(&Original, &Destination, sizeof(QUIC_SETTINGS_INTERNAL)));
+}
+
 TEST(SettingsTest, OldSettingsSizeGetDoesNotWriteMaxPacingRate)
 {
     alignas(QUIC_SETTINGS) uint8_t Buffer[sizeof(QUIC_SETTINGS)];
@@ -493,6 +656,57 @@ TEST(SettingsTest, OldSettingsSizeGetDoesNotWriteMaxPacingRate)
             reinterpret_cast<QUIC_SETTINGS*>(Buffer)));
     ASSERT_EQ(OldSize, SettingsLength);
     for (uint32_t i = OldSize; i < sizeof(Buffer); ++i) {
+        ASSERT_EQ(Canary, Buffer[i]) << "Canary overwritten at byte " << i;
+    }
+}
+
+TEST(SettingsTest, SettingsSizeThroughMaxDoesNotRequireMinPacingRate)
+{
+    const uint32_t MaxOnlySize =
+        (uint32_t)CXPLAT_STRUCT_SIZE_THRU_FIELD(
+            QUIC_SETTINGS,
+            MaxPacingRateBytesPerSecond);
+    alignas(QUIC_SETTINGS) uint8_t Buffer[sizeof(QUIC_SETTINGS)];
+    CxPlatZeroMemory(Buffer, sizeof(Buffer));
+
+    QUIC_SETTINGS_INTERNAL InternalSettings{};
+    InternalSettings.MinPacingRateBytesPerSecond = 1234;
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicSettingsSettingsToInternal(
+            MaxOnlySize,
+            reinterpret_cast<QUIC_SETTINGS*>(Buffer),
+            &InternalSettings));
+    ASSERT_EQ(FALSE, InternalSettings.IsSet.MinPacingRateBytesPerSecond);
+    ASSERT_EQ(1234u, InternalSettings.MinPacingRateBytesPerSecond);
+}
+
+TEST(SettingsTest, SettingsSizeThroughMaxGetDoesNotWriteMinPacingRate)
+{
+    alignas(QUIC_SETTINGS) uint8_t Buffer[sizeof(QUIC_SETTINGS)];
+    CxPlatZeroMemory(Buffer, sizeof(Buffer));
+    const uint32_t MaxOnlySize =
+        (uint32_t)CXPLAT_STRUCT_SIZE_THRU_FIELD(
+            QUIC_SETTINGS,
+            MaxPacingRateBytesPerSecond);
+    const uint8_t Canary = 0xA5;
+    for (uint32_t i = MaxOnlySize; i < sizeof(Buffer); ++i) {
+        Buffer[i] = Canary;
+    }
+
+    QUIC_SETTINGS_INTERNAL InternalSettings{};
+    InternalSettings.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    InternalSettings.MinPacingRateBytesPerSecond = 1234;
+    uint32_t SettingsLength = MaxOnlySize;
+
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicSettingsGetSettings(
+            &InternalSettings,
+            &SettingsLength,
+            reinterpret_cast<QUIC_SETTINGS*>(Buffer)));
+    ASSERT_EQ(MaxOnlySize, SettingsLength);
+    for (uint32_t i = MaxOnlySize; i < sizeof(Buffer); ++i) {
         ASSERT_EQ(Canary, Buffer[i]) << "Canary overwritten at byte " << i;
     }
 }

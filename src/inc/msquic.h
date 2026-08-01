@@ -847,11 +847,13 @@ typedef struct QUIC_SETTINGS {
             uint64_t QTIPEnabled                            : 1;
             uint64_t ReservedRioEnabled                     : 1;
             uint64_t MaxPacingRateBytesPerSecond            : 1;
-            uint64_t RESERVED                               : 17;
+            uint64_t MinPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 16;
 #else
             uint64_t RESERVED_PREVIEW                       : 8;
             uint64_t MaxPacingRateBytesPerSecond            : 1;
-            uint64_t RESERVED                               : 17;
+            uint64_t MinPacingRateBytesPerSecond            : 1;
+            uint64_t RESERVED                               : 16;
 #endif
         } IsSet;
     };
@@ -913,6 +915,7 @@ typedef struct QUIC_SETTINGS {
     uint32_t StreamRecvWindowBidiRemoteDefault;
     uint32_t StreamRecvWindowUnidiDefault;
     uint64_t MaxPacingRateBytesPerSecond;
+    uint64_t MinPacingRateBytesPerSecond;
 
 } QUIC_SETTINGS;
 

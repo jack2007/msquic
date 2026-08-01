@@ -744,6 +744,11 @@ public:
         IsSet.MaxPacingRateBytesPerSecond = TRUE;
         return *this;
     }
+    MsQuicSettings& SetMinPacingRateBytesPerSecond(uint64_t Value) {
+        MinPacingRateBytesPerSecond = Value;
+        IsSet.MinPacingRateBytesPerSecond = TRUE;
+        return *this;
+    }
 
     QUIC_STATUS
     SetGlobal() const noexcept {
