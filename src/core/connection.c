@@ -6530,12 +6530,6 @@ QuicConnParamSet(
             break;
         }
 
-        if (Connection->State.Started &&
-            InternalSettings.IsSet.MaxPacingRateBytesPerSecond) {
-            Status = QUIC_STATUS_INVALID_STATE;
-            break;
-        }
-
         if (!QuicConnApplyNewSettings(
                 Connection,
                 TRUE,
@@ -7152,7 +7146,8 @@ QuicConnGetNetworkStatistics(
         QUIC_NETWORK_STATISTICS* Stats
     )
 {
-    if (*StatsLength < sizeof(QUIC_NETWORK_STATISTICS)) {
+    const uint32_t CallerStatsLength = *StatsLength;
+    if (CallerStatsLength < QUIC_NETWORK_STATISTICS_SIZE_1) {
         *StatsLength = sizeof(QUIC_NETWORK_STATISTICS);
         return QUIC_STATUS_BUFFER_TOO_SMALL;
     }
@@ -7161,10 +7156,15 @@ QuicConnGetNetworkStatistics(
         return QUIC_STATUS_INVALID_PARAMETER;
     }
 
-    CxPlatZeroMemory(Stats, sizeof(QUIC_NETWORK_STATISTICS));
+    QUIC_NETWORK_STATISTICS FullStats = {0};
 
     Connection->CongestionControl.QuicCongestionControlGetNetworkStatistics(
-        Connection, &Connection->CongestionControl, Stats);
+        Connection, &Connection->CongestionControl, &FullStats);
+
+    *StatsLength = CXPLAT_MIN(
+        CallerStatsLength,
+        (uint32_t)sizeof(QUIC_NETWORK_STATISTICS));
+    CxPlatCopyMemory(Stats, &FullStats, *StatsLength);
 
     return QUIC_STATUS_SUCCESS;
 }
@@ -7627,6 +7627,11 @@ QuicConnApplyNewSettings(
     _In_ const QUIC_SETTINGS_INTERNAL* NewSettings
     )
 {
+    const uint64_t OldMinPacingRateBytesPerSecond =
+        Connection->Settings.MinPacingRateBytesPerSecond;
+    const uint64_t OldMaxPacingRateBytesPerSecond =
+        Connection->Settings.MaxPacingRateBytesPerSecond;
+
     QuicTraceLogConnInfo(
         ApplySettings,
         Connection,
@@ -7638,6 +7643,19 @@ QuicConnApplyNewSettings(
             !Connection->State.Started,
             NewSettings)) {
         return FALSE;
+    }
+
+    if (Connection->State.Started &&
+        Connection->Settings.CongestionControlAlgorithm ==
+            QUIC_CONGESTION_CONTROL_ALGORITHM_BBR &&
+        (OldMinPacingRateBytesPerSecond !=
+            Connection->Settings.MinPacingRateBytesPerSecond ||
+         OldMaxPacingRateBytesPerSecond !=
+            Connection->Settings.MaxPacingRateBytesPerSecond)) {
+        BbrCongestionControlOnPacingRateChanged(
+            &Connection->CongestionControl,
+            OldMaxPacingRateBytesPerSecond);
+        QuicSendQueueFlush(&Connection->Send, REASON_CONGESTION_CONTROL);
     }
 
     if (!Connection->State.Started) {

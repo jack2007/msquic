@@ -17,7 +17,12 @@ Abstract:
 extern "C" {
 void BbrCongestionControlInitialize(QUIC_CONGESTION_CONTROL* Cc, const QUIC_SETTINGS_INTERNAL* Settings);
 uint64_t BbrCongestionControlGetBandwidth(const QUIC_CONGESTION_CONTROL* Cc);
+uint64_t BbrCongestionControlGetEffectivePacingRate(const QUIC_CONGESTION_CONTROL* Cc);
+uint32_t BbrCongestionControlGetCongestionWindow(const QUIC_CONGESTION_CONTROL* Cc);
 uint32_t BbrCongestionControlGetTargetCwnd(QUIC_CONGESTION_CONTROL* Cc, uint32_t Gain);
+void BbrCongestionControlOnPacingRateChanged(
+    QUIC_CONGESTION_CONTROL* Cc,
+    uint64_t OldMaxRate);
 void BbrCongestionControlGetNetworkStatistics(
     const QUIC_CONNECTION* Connection,
     const QUIC_CONGESTION_CONTROL* Cc,
@@ -172,16 +177,21 @@ protected:
         uint16_t Mtu = 1280,
         bool PacingEnabled = false,
         bool NetStatsEnabled = false,
-        uint64_t MaxPacingRateBytesPerSecond = 0)
+        uint64_t MaxPacingRateBytesPerSecond = 0,
+        uint64_t MinPacingRateBytesPerSecond = 0)
     {
         Settings.InitialWindowPackets = WindowPackets;
         Settings.MaxPacingRateBytesPerSecond =
             MaxPacingRateBytesPerSecond;
+        Settings.MinPacingRateBytesPerSecond =
+            MinPacingRateBytesPerSecond;
         InitBbrMockConnection(Connection, Mtu);
         Connection.Settings.PacingEnabled = PacingEnabled ? TRUE : FALSE;
         Connection.Settings.NetStatsEventEnabled = NetStatsEnabled ? TRUE : FALSE;
         Connection.Settings.MaxPacingRateBytesPerSecond =
             MaxPacingRateBytesPerSecond;
+        Connection.Settings.MinPacingRateBytesPerSecond =
+            MinPacingRateBytesPerSecond;
         if (NetStatsEnabled) {
             Connection.ClientCallbackHandler = DummyConnectionCallback;
             // The callback receives Connection->ClientContext which lives inside the
@@ -2688,4 +2698,128 @@ TEST_F(BbrTest_DeepTest, RateLimitReportsConfiguredAndEffectiveRates)
     BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
     ASSERT_EQ(MaxRate, Stats.MaxPacingRateBytesPerSecond);
     ASSERT_LE(Stats.EffectivePacingRateBytesPerSecond, MaxRate);
+}
+
+TEST_F(BbrTest_DeepTest, MinimumPacingRateRaisesEffectiveRate)
+{
+    constexpr uint64_t MinRate = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, 0, MinRate);
+    PumpBandwidthSample(1050000, 1, 1200, 100000, 45000);
+
+    QUIC_NETWORK_STATISTICS Stats{};
+    BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
+    ASSERT_EQ(MinRate, Stats.MinPacingRateBytesPerSecond);
+    ASSERT_GE(Stats.EffectivePacingRateBytesPerSecond, MinRate);
+    ASSERT_EQ(BbrCongestionControlGetBandwidth(CC) / 8, Stats.Bandwidth);
+}
+
+TEST_F(BbrTest_DeepTest, MinimumPacingRateCannotExceedCongestionWindow)
+{
+    constexpr uint64_t MinRate = 1000000000;
+    InitializeWithDefaults(10, 1280, true, false, 0, MinRate);
+    PumpBandwidthSample(1050000, 1, 1200, 1000000, 45000);
+
+    const uint32_t Allowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
+    ASSERT_LE(Allowance, BbrCongestionControlGetCongestionWindow(CC));
+    ASSERT_LE(Allowance, BbrCongestionControlGetCongestionWindow(CC) >> 2);
+}
+
+TEST_F(BbrTest_DeepTest, MinimumPacingRateRaisesTimeAllowance)
+{
+    constexpr uint64_t MinRate = 10000000;
+    InitializeWithDefaults(2000, 1280, true, false, 0, MinRate);
+    QuicSlidingWindowExtremumUpdateMax(
+        &Bbr->BandwidthFilter.WindowedMaxFilter,
+        8,
+        1); // Raw BW_UNIT = 1 B/s.
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 45000;
+
+    const uint32_t FlooredAllowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
+    Connection.Settings.MinPacingRateBytesPerSecond = 0;
+    const uint32_t RawAllowance =
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
+
+    ASSERT_EQ(10000u, FlooredAllowance);
+    ASSERT_EQ(8000u, RawAllowance);
+    ASSERT_GT(FlooredAllowance, RawAllowance);
+}
+
+TEST_F(BbrTest_DeepTest, PacingBoundsEffectiveRateMatrix)
+{
+    struct TEST_CASE {
+        uint64_t MinRate;
+        uint64_t MaxRate;
+        uint64_t RawBandwidth;
+        uint64_t ExpectedRate;
+    };
+    constexpr TEST_CASE Cases[] = {
+        {0, 0, 800000, 2309375},
+        {3000000, 0, 800000, 3000000},
+        {0, 2000000, 800000, 2000000},
+        {1000000, 2000000, 800000, 2000000},
+        {2000000, 2000000, 800000, 2000000},
+        {1000000, 0, 0, 1000000},
+        {0, 2000000, 0, 2000000},
+    };
+
+    for (const auto& TestCase : Cases) {
+        InitializeWithDefaults(
+            2000,
+            1280,
+            true,
+            false,
+            TestCase.MaxRate,
+            TestCase.MinRate);
+        if (TestCase.RawBandwidth != 0) {
+            QuicSlidingWindowExtremumUpdateMax(
+                &Bbr->BandwidthFilter.WindowedMaxFilter,
+                TestCase.RawBandwidth * 8,
+                1);
+        }
+        ASSERT_EQ(
+            TestCase.ExpectedRate,
+            BbrCongestionControlGetEffectivePacingRate(CC))
+            << "min=" << TestCase.MinRate
+            << ", max=" << TestCase.MaxRate
+            << ", bandwidth=" << TestCase.RawBandwidth;
+    }
+}
+
+TEST_F(BbrTest_DeepTest, RateLimitHotUpdateTransitionsBudget)
+{
+    constexpr uint64_t InitialMaxRate = 10000000;
+    InitializeWithDefaults(2000, 1280, true, false, 0);
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+
+    Connection.Settings.MaxPacingRateBytesPerSecond = InitialMaxRate;
+    BbrCongestionControlOnPacingRateChanged(CC, 0);
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(DatagramPayload, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+
+    Bbr->RateLimitBudgetBytes = UINT32_MAX;
+    Bbr->RateLimitRemainderNumerator = 999;
+    Connection.Settings.MaxPacingRateBytesPerSecond = 125000;
+    BbrCongestionControlOnPacingRateChanged(CC, InitialMaxRate);
+    ASSERT_LE(Bbr->RateLimitBudgetBytes, DatagramPayload);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+
+    const uint64_t ClampedBudget = Bbr->RateLimitBudgetBytes;
+    Bbr->RateLimitRemainderNumerator = 777;
+    Connection.Settings.MaxPacingRateBytesPerSecond = 20000000;
+    BbrCongestionControlOnPacingRateChanged(CC, 125000);
+    ASSERT_EQ(ClampedBudget, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+
+    Connection.Settings.MaxPacingRateBytesPerSecond = 0;
+    BbrCongestionControlOnPacingRateChanged(CC, 20000000);
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
 }

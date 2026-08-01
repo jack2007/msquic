@@ -4351,9 +4351,8 @@ void QuicTest_QUIC_PARAM_CONN_SETTINGS(MsQuicRegistration& Registration, MsQuicC
         }
 
         //
-        // MaxPacingRateBytesPerSecond is a creation-only setting. It can be
-        // set directly before start, but a direct update after start must not
-        // change the value captured by the connection.
+        // Pacing-rate bounds can be set before start and atomically updated
+        // after start.
         //
         {
             TestScopeLogger LogScope2("Max pacing rate before ConnectionStart");
@@ -4384,10 +4383,16 @@ void QuicTest_QUIC_PARAM_CONN_SETTINGS(MsQuicRegistration& Registration, MsQuicC
         }
 
         {
-            TestScopeLogger LogScope2("Max pacing rate after ConnectionStart");
+            TestScopeLogger LogScope2("Pacing rate bounds after ConnectionStart");
+            constexpr uint64_t ConfiguredMinPacingRate = 1'000'000;
             constexpr uint64_t ConfiguredMaxPacingRate = 2'000'000;
+            constexpr uint64_t UpdatedMinPacingRate = 1'500'000;
             constexpr uint64_t UpdatedMaxPacingRate = 3'000'000;
             MsQuicSettings ConfigurationSettings;
+            ConfigurationSettings.SetCongestionControlAlgorithm(
+                QUIC_CONGESTION_CONTROL_ALGORITHM_BBR);
+            ConfigurationSettings.SetMinPacingRateBytesPerSecond(
+                ConfiguredMinPacingRate);
             ConfigurationSettings.SetMaxPacingRateBytesPerSecond(
                 ConfiguredMaxPacingRate);
             MsQuicConfiguration Configuration(
@@ -4415,15 +4420,20 @@ void QuicTest_QUIC_PARAM_CONN_SETTINGS(MsQuicRegistration& Registration, MsQuicC
                     &AppliedSettingsLength,
                     &AppliedSettings));
             TEST_TRUE(AppliedSettings.IsSet.MaxPacingRateBytesPerSecond);
+            TEST_TRUE(AppliedSettings.IsSet.MinPacingRateBytesPerSecond);
+            TEST_EQUAL(
+                AppliedSettings.MinPacingRateBytesPerSecond,
+                ConfiguredMinPacingRate);
             TEST_EQUAL(
                 AppliedSettings.MaxPacingRateBytesPerSecond,
                 ConfiguredMaxPacingRate);
 
             QUIC_SETTINGS Update{0};
+            Update.IsSet.MinPacingRateBytesPerSecond = TRUE;
+            Update.MinPacingRateBytesPerSecond = UpdatedMinPacingRate;
             Update.IsSet.MaxPacingRateBytesPerSecond = TRUE;
             Update.MaxPacingRateBytesPerSecond = UpdatedMaxPacingRate;
-            TEST_QUIC_STATUS(
-                QUIC_STATUS_INVALID_STATE,
+            TEST_QUIC_SUCCEEDED(
                 Connection.SetParam(
                     QUIC_PARAM_CONN_SETTINGS,
                     sizeof(Update),
@@ -4437,8 +4447,35 @@ void QuicTest_QUIC_PARAM_CONN_SETTINGS(MsQuicRegistration& Registration, MsQuicC
                     &AppliedSettingsLength,
                     &AppliedSettings));
             TEST_EQUAL(
+                AppliedSettings.MinPacingRateBytesPerSecond,
+                UpdatedMinPacingRate);
+            TEST_EQUAL(
                 AppliedSettings.MaxPacingRateBytesPerSecond,
-                ConfiguredMaxPacingRate);
+                UpdatedMaxPacingRate);
+
+            QUIC_SETTINGS Invalid{0};
+            Invalid.IsSet.MinPacingRateBytesPerSecond = TRUE;
+            Invalid.MinPacingRateBytesPerSecond = 4'000'000;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                Connection.SetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    sizeof(Invalid),
+                    &Invalid));
+
+            AppliedSettings = {};
+            AppliedSettingsLength = sizeof(AppliedSettings);
+            TEST_QUIC_SUCCEEDED(
+                Connection.GetParam(
+                    QUIC_PARAM_CONN_SETTINGS,
+                    &AppliedSettingsLength,
+                    &AppliedSettings));
+            TEST_EQUAL(
+                AppliedSettings.MinPacingRateBytesPerSecond,
+                UpdatedMinPacingRate);
+            TEST_EQUAL(
+                AppliedSettings.MaxPacingRateBytesPerSecond,
+                UpdatedMaxPacingRate);
 
             //
             // Older, shorter QUIC_SETTINGS inputs and updates which don't set
@@ -5417,6 +5454,23 @@ void QuicTest_QUIC_PARAM_CONN_NETWORK_STATISTICS(MsQuicRegistration& Registratio
         MsQuicConnection Connection(Registration);
         TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
         SimpleGetParamTest(Connection.Handle, QUIC_PARAM_CONN_NETWORK_STATISTICS, sizeof(QUIC_NETWORK_STATISTICS), nullptr, true);
+
+        struct OLD_NETWORK_STATISTICS_BUFFER {
+            uint8_t Bytes[offsetof(
+                QUIC_NETWORK_STATISTICS,
+                MinPacingRateBytesPerSecond)];
+            uint64_t Canary;
+        } OldBuffer{};
+        constexpr uint64_t Canary = 0x123456789abcdef0ULL;
+        OldBuffer.Canary = Canary;
+        uint32_t OldBufferLength = sizeof(OldBuffer.Bytes);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_NETWORK_STATISTICS,
+                &OldBufferLength,
+                OldBuffer.Bytes));
+        TEST_EQUAL(OldBufferLength, sizeof(OldBuffer.Bytes));
+        TEST_EQUAL(OldBuffer.Canary, Canary);
     }
 #endif // QUIC_API_ENABLE_PREVIEW_FEATURES
     UNREFERENCED_PARAMETER(Registration);

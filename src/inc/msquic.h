@@ -702,11 +702,17 @@ typedef struct QUIC_NETWORK_STATISTICS
     uint32_t LastLostRetransmittableBytes;// Last loss batch retransmittable byte count
     uint64_t MaxPacingRateBytesPerSecond; // Configured per-connection pacing-rate cap
     uint64_t EffectivePacingRateBytesPerSecond; // Effective BBR pacing rate after applying the cap
+    uint64_t MinPacingRateBytesPerSecond; // Configured per-connection pacing-rate floor
 
 } QUIC_NETWORK_STATISTICS;
 
 #define QUIC_STRUCT_SIZE_THRU_FIELD(Struct, Field) \
     (FIELD_OFFSET(Struct, Field) + sizeof(((Struct*)0)->Field))
+
+#define QUIC_NETWORK_STATISTICS_SIZE_1 \
+    QUIC_STRUCT_SIZE_THRU_FIELD(QUIC_NETWORK_STATISTICS, EffectivePacingRateBytesPerSecond)
+#define QUIC_NETWORK_STATISTICS_SIZE_2 \
+    QUIC_STRUCT_SIZE_THRU_FIELD(QUIC_NETWORK_STATISTICS, MinPacingRateBytesPerSecond)
 
 #define QUIC_STATISTICS_V2_SIZE_1   QUIC_STRUCT_SIZE_THRU_FIELD(QUIC_STATISTICS_V2, KeyUpdateCount)         // MsQuic v2.0 final size
 #define QUIC_STATISTICS_V2_SIZE_2   QUIC_STRUCT_SIZE_THRU_FIELD(QUIC_STATISTICS_V2, DestCidUpdateCount)     // MsQuic v2.1 final size

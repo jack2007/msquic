@@ -265,16 +265,26 @@ BbrCongestionControlGetEffectivePacingRate(
             EstimatedBandwidthBytesPerSecond,
             Cc->Bbr.PacingGain,
             GAIN_UNIT);
+    const uint64_t MinRate =
+        Connection->Settings.MinPacingRateBytesPerSecond;
     const uint64_t MaxRate =
         Connection->Settings.MaxPacingRateBytesPerSecond;
 
-    if (MaxRate == 0 || !Connection->Settings.PacingEnabled) {
+    if (!Connection->Settings.PacingEnabled) {
         return EstimatedPacingRateBytesPerSecond;
     }
+
+    uint64_t EffectiveRate = EstimatedPacingRateBytesPerSecond;
     if (EstimatedBandwidthBytesPerSecond == 0) {
-        return MaxRate;
+        EffectiveRate = MinRate != 0 ? MinRate : MaxRate;
     }
-    return CXPLAT_MIN(EstimatedPacingRateBytesPerSecond, MaxRate);
+    if (MinRate != 0) {
+        EffectiveRate = CXPLAT_MAX(EffectiveRate, MinRate);
+    }
+    if (MaxRate != 0) {
+        EffectiveRate = CXPLAT_MIN(EffectiveRate, MaxRate);
+    }
+    return EffectiveRate;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -439,6 +449,8 @@ BbrCongestionControlGetNetworkStatistics(
         Connection->Settings.MaxPacingRateBytesPerSecond;
     NetworkStatistics->EffectivePacingRateBytesPerSecond =
         BbrCongestionControlGetEffectivePacingRate(Cc);
+    NetworkStatistics->MinPacingRateBytesPerSecond =
+        Connection->Settings.MinPacingRateBytesPerSecond;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -772,6 +784,37 @@ BbrCongestionControlGetRateLimitBurstCapacity(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+void
+BbrCongestionControlOnPacingRateChanged(
+    _In_ QUIC_CONGESTION_CONTROL* Cc,
+    _In_ uint64_t OldMaxRate
+    )
+{
+    QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+    const QUIC_CONNECTION* Connection =
+        QuicCongestionControlGetConnection(Cc);
+    const uint64_t NewMaxRate =
+        Connection->Settings.MaxPacingRateBytesPerSecond;
+
+    if (NewMaxRate == 0 || !Connection->Settings.PacingEnabled) {
+        Bbr->RateLimitInitialized = FALSE;
+        Bbr->RateLimitBudgetBytes = 0;
+        Bbr->RateLimitRemainderNumerator = 0;
+        return;
+    }
+
+    if (OldMaxRate == 0 || !Bbr->RateLimitInitialized) {
+        BbrCongestionControlInitializeRateLimitBudget(Cc);
+        return;
+    }
+
+    Bbr->RateLimitRemainderNumerator = 0;
+    Bbr->RateLimitBudgetBytes = CXPLAT_MIN(
+        Bbr->RateLimitBudgetBytes,
+        BbrCongestionControlGetRateLimitBurstCapacity(Cc));
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static void
 BbrCongestionControlRefillRateLimitBudget(
     _In_ QUIC_CONGESTION_CONTROL* Cc,
@@ -865,6 +908,19 @@ BbrCongestionControlGetSendAllowance(
                 CongestionWindow * Bbr->PacingGain / GAIN_UNIT - Bbr->BytesInFlight);
         } else {
             SendAllowance = (uint32_t)(BandwidthEst * Bbr->PacingGain * TimeSinceLastSend / GAIN_UNIT);
+        }
+
+        if (Connection->Settings.MinPacingRateBytesPerSecond != 0) {
+            const uint64_t MinPacingAllowance =
+                BbrSaturatingMultiplyDivide(
+                    Connection->Settings.MinPacingRateBytesPerSecond,
+                    (uint32_t)CXPLAT_MIN(
+                        TimeSinceLastSend,
+                        (uint64_t)UINT32_MAX),
+                    kMicroSecsInSec);
+            SendAllowance = (uint32_t)CXPLAT_MIN(
+                CXPLAT_MAX((uint64_t)SendAllowance, MinPacingAllowance),
+                (uint64_t)UINT32_MAX);
         }
 
         if (SendAllowance > CongestionWindow - Bbr->BytesInFlight) {

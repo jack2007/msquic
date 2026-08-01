@@ -233,6 +233,13 @@ BbrCongestionControlInitialize(
     _In_ const QUIC_SETTINGS_INTERNAL* Settings
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+BbrCongestionControlOnPacingRateChanged(
+    _In_ QUIC_CONGESTION_CONTROL* Cc,
+    _In_ uint64_t OldMaxRate
+    );
+
 #if defined(__cplusplus)
 }
 #endif
