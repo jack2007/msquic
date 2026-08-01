@@ -611,6 +611,25 @@ TEST(SettingsTest, PacingRateBoundsValidatePartialMinAgainstCurrentMax)
         memcmp(&Original, &Destination, sizeof(QUIC_SETTINGS_INTERNAL)));
 }
 
+TEST(SettingsTest, PacingRateBoundsIgnoreInvalidSourceMinWithoutOverwrite)
+{
+    QUIC_SETTINGS_INTERNAL Destination{};
+    Destination.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Destination.MinPacingRateBytesPerSecond = 1000;
+    Destination.IsSet.MaxPacingRateBytesPerSecond = TRUE;
+    Destination.MaxPacingRateBytesPerSecond = 2000;
+    const QUIC_SETTINGS_INTERNAL Original = Destination;
+
+    QUIC_SETTINGS_INTERNAL Source{};
+    Source.IsSet.MinPacingRateBytesPerSecond = TRUE;
+    Source.MinPacingRateBytesPerSecond = 3000;
+
+    ASSERT_TRUE(QuicSettingApply(&Destination, FALSE, FALSE, &Source));
+    ASSERT_EQ(
+        0,
+        memcmp(&Original, &Destination, sizeof(QUIC_SETTINGS_INTERNAL)));
+}
+
 TEST(SettingsTest, PacingRateBoundsValidatePartialMaxAgainstCurrentMin)
 {
     QUIC_SETTINGS_INTERNAL Destination{};
