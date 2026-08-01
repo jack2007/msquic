@@ -240,6 +240,12 @@ BbrCongestionControlOnPacingRateChanged(
     _In_ uint64_t OldMaxRate
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+BbrCongestionControlIsActive(
+    _In_ const QUIC_CONGESTION_CONTROL* Cc
+    );
+
 #if defined(__cplusplus)
 }
 #endif

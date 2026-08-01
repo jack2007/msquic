@@ -956,6 +956,22 @@ BbrCongestionControlGetSendAllowance(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+BbrCongestionControlIsActive(
+    _In_ const QUIC_CONGESTION_CONTROL* Cc
+    )
+{
+    //
+    // The configured algorithm can change after the connection starts, but
+    // the active congestion-control vtable does not. Use its implementation
+    // identity instead of the mutable setting.
+    //
+    return
+        Cc->QuicCongestionControlGetSendAllowance ==
+            BbrCongestionControlGetSendAllowance;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 void
 BbrCongestionControlTransitToProbeRtt(
     _In_ QUIC_CONGESTION_CONTROL* Cc,

@@ -23,6 +23,10 @@ uint32_t BbrCongestionControlGetTargetCwnd(QUIC_CONGESTION_CONTROL* Cc, uint32_t
 void BbrCongestionControlOnPacingRateChanged(
     QUIC_CONGESTION_CONTROL* Cc,
     uint64_t OldMaxRate);
+BOOLEAN QuicConnApplyActiveBbrPacingRateChange(
+    QUIC_CONNECTION* Connection,
+    uint64_t OldMinRate,
+    uint64_t OldMaxRate);
 void BbrCongestionControlGetNetworkStatistics(
     const QUIC_CONNECTION* Connection,
     const QUIC_CONGESTION_CONTROL* Cc,
@@ -2819,6 +2823,62 @@ TEST_F(BbrTest_DeepTest, RateLimitHotUpdateTransitionsBudget)
 
     Connection.Settings.MaxPacingRateBytesPerSecond = 0;
     BbrCongestionControlOnPacingRateChanged(CC, 20000000);
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+}
+
+TEST_F(BbrTest_DeepTest, ReportedBbrSettingDoesNotRefreshActiveCubic)
+{
+    InitBbrMockConnection(Connection, 1280);
+    QUIC_SETTINGS_INTERNAL CubicSettings{};
+    CubicSettings.InitialWindowPackets = 10;
+    CubicSettings.CongestionControlAlgorithm =
+        QUIC_CONGESTION_CONTROL_ALGORITHM_CUBIC;
+    CubicCongestionControlInitialize(
+        &Connection.CongestionControl,
+        &CubicSettings);
+    ASSERT_STREQ("Cubic", Connection.CongestionControl.Name);
+
+    Connection.State.Started = TRUE;
+    Connection.Settings.PacingEnabled = TRUE;
+    Connection.Settings.CongestionControlAlgorithm =
+        QUIC_CONGESTION_CONTROL_ALGORITHM_BBR;
+    Connection.Settings.MaxPacingRateBytesPerSecond = 1000000;
+    const QUIC_CONGESTION_CONTROL ActiveCubicBefore =
+        Connection.CongestionControl;
+
+    ASSERT_FALSE(
+        QuicConnApplyActiveBbrPacingRateChange(
+            &Connection,
+            0,
+            0));
+    ASSERT_EQ(
+        0,
+        memcmp(
+            &ActiveCubicBefore,
+            &Connection.CongestionControl,
+            sizeof(ActiveCubicBefore)));
+}
+
+TEST_F(BbrTest_DeepTest, ReportedCubicSettingStillRefreshesActiveBbrAndRequestsFlush)
+{
+    constexpr uint64_t OldMaxRate = 10000000;
+    InitializeWithDefaults(2000, 1280, true, false, OldMaxRate);
+    ASSERT_STREQ("BBR", Connection.CongestionControl.Name);
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
+
+    Connection.State.Started = TRUE;
+    Connection.Settings.CongestionControlAlgorithm =
+        QUIC_CONGESTION_CONTROL_ALGORITHM_CUBIC;
+    Connection.Settings.MaxPacingRateBytesPerSecond = 0;
+
+    ASSERT_TRUE(
+        QuicConnApplyActiveBbrPacingRateChange(
+            &Connection,
+            0,
+            OldMaxRate));
+    ASSERT_STREQ("BBR", Connection.CongestionControl.Name);
     ASSERT_FALSE(Bbr->RateLimitInitialized);
     ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
     ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);

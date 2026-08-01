@@ -52,6 +52,14 @@ QuicConnApplyNewSettings(
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+QuicConnApplyActiveBbrPacingRateChange(
+    _In_ QUIC_CONNECTION* Connection,
+    _In_ uint64_t OldMinRate,
+    _In_ uint64_t OldMaxRate
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 _Success_(return == QUIC_STATUS_SUCCESS)
 QUIC_STATUS
@@ -7645,16 +7653,10 @@ QuicConnApplyNewSettings(
         return FALSE;
     }
 
-    if (Connection->State.Started &&
-        Connection->Settings.CongestionControlAlgorithm ==
-            QUIC_CONGESTION_CONTROL_ALGORITHM_BBR &&
-        (OldMinPacingRateBytesPerSecond !=
-            Connection->Settings.MinPacingRateBytesPerSecond ||
-         OldMaxPacingRateBytesPerSecond !=
-            Connection->Settings.MaxPacingRateBytesPerSecond)) {
-        BbrCongestionControlOnPacingRateChanged(
-            &Connection->CongestionControl,
-            OldMaxPacingRateBytesPerSecond);
+    if (QuicConnApplyActiveBbrPacingRateChange(
+            Connection,
+            OldMinPacingRateBytesPerSecond,
+            OldMaxPacingRateBytesPerSecond)) {
         QuicSendQueueFlush(&Connection->Send, REASON_CONGESTION_CONTROL);
     }
 
@@ -7796,6 +7798,28 @@ QuicConnApplyNewSettings(
         QuicSettingsDump(&Connection->Settings); // TODO - Really necessary?
     }
 
+    return TRUE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+QuicConnApplyActiveBbrPacingRateChange(
+    _In_ QUIC_CONNECTION* Connection,
+    _In_ uint64_t OldMinRate,
+    _In_ uint64_t OldMaxRate
+    )
+{
+    if (!Connection->State.Started ||
+        !BbrCongestionControlIsActive(&Connection->CongestionControl) ||
+        (OldMinRate == Connection->Settings.MinPacingRateBytesPerSecond &&
+         OldMaxRate == Connection->Settings.MaxPacingRateBytesPerSecond)) {
+        return FALSE;
+    }
+
+    BbrCongestionControlOnPacingRateChanged(
+        &Connection->CongestionControl,
+        OldMaxRate);
+    // The caller queues a congestion-control send flush on TRUE.
     return TRUE;
 }
 
