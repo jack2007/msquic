@@ -467,33 +467,42 @@ Congestion Window
 
 `Bandwidth`
 
-原始 BBR bandwidth estimator 的结果，单位为 bytes/s。该值不会被
-`MinPacingRateBytesPerSecond` 或 `MaxPacingRateBytesPerSecond` 修改或 clamp。
+active BBR 下，该字段是原始 BBR bandwidth estimator 的结果，单位为 bytes/s，
+不会被 `MinPacingRateBytesPerSecond` 或 `MaxPacingRateBytesPerSecond` 修改或
+clamp。其他 congestion controller 使用各自的统计实现；当前 Cubic 返回由
+`CongestionWindow / SmoothedRTT` 派生的值，它不是 raw BBR estimate，不应按 BBR
+语义解释。
 
 `MaxPacingRateBytesPerSecond`
 
-本连接本端 sender 当前配置的最大 pacing rate，单位为 bytes/s；`0` 表示未启用
-soft cap。通过 `QUIC_PARAM_CONN_SETTINGS` 对活动连接成功热更新后，后续统计会
-报告更新后的值；修改 Configuration 不会反向改变既有连接。
+active BBR 下，这是本连接本端 sender 当前配置的最大 pacing rate，单位为
+bytes/s；`0` 表示未启用 soft cap。通过 `QUIC_PARAM_CONN_SETTINGS` 对活动 BBR
+成功热更新后，后续统计会报告更新后的值；修改 Configuration 不会反向改变既有
+连接。当前 Cubic statistics 实现不填充追加的 rate 字段，因此该字段保持为 `0`，
+即使 connection settings 中保存了边界值也不表示 Cubic 应用了该上限。
 
 `EffectivePacingRateBytesPerSecond`
 
-本连接本端 BBR 在应用 configured min/max 后使用的 effective pacing rate，单位为
-bytes/s。它与 raw `Bandwidth` 和两个 configured bound 是不同含义的统计值。若
-pacing disabled，min/max 不参与该值计算。
+active BBR 下，这是本连接本端 BBR 在应用 configured min/max 后使用的 effective
+pacing rate，单位为 bytes/s。它与 raw `Bandwidth` 和两个 configured bound 是
+不同含义的统计值。若 pacing disabled，min/max 不参与该值计算。当前 Cubic
+statistics 实现不填充该字段，因此返回 `0`。
 
 `MinPacingRateBytesPerSecond`
 
-本连接本端 sender 当前配置的最小 pacing rate，单位为 bytes/s；`0` 表示未启用
-soft pacing floor。该 floor 不绕过 congestion control、recovery window、bytes
-in flight 或 flow control，因而不能视为吞吐 SLA。
+active BBR 下，这是本连接本端 sender 当前配置的最小 pacing rate，单位为
+bytes/s；`0` 表示未启用 soft pacing floor。该 floor 不绕过 congestion control、
+recovery window、bytes in flight 或 flow control，因而不能视为吞吐 SLA。当前
+Cubic statistics 实现不填充追加的 rate 字段，因此该字段保持为 `0`。
 
 `MinPacingRateBytesPerSecond` 追加在结构尾部。传入
 `QUIC_NETWORK_STATISTICS_SIZE_1` 的旧调用方仍会获得截至
 `EffectivePacingRateBytesPerSecond` 的原有字段，MsQuic 不会越界写入 min；传入
 `QUIC_NETWORK_STATISTICS_SIZE_2` 或 `sizeof(QUIC_NETWORK_STATISTICS)` 才会获得
-min 字段。`QUIC_PARAM_CONN_NETWORK_STATISTICS` 返回的实际长度不会超过调用方
-提供的 buffer 长度。
+min 字段。成功返回时，写入字节数和返回的 `*StatsLength` 均不超过调用方提供的
+buffer 长度。若输入长度小于 `QUIC_NETWORK_STATISTICS_SIZE_1`，接口不写入
+statistics，返回 `QUIC_STATUS_BUFFER_TOO_SMALL`，并将 `*StatsLength` 设置为完整
+`QUIC_NETWORK_STATISTICS` 所需大小；此时该 required size 可以大于输入长度。
 
 
 # See Also

@@ -303,9 +303,9 @@ bytes in flight、congestion control 或 flow control，也不能保证应用供
 规则。
 
 两字段均可在连接启动前设置，也可通过 `QUIC_PARAM_CONN_SETTINGS` 更新已启动的
-BBR 连接（started BBR connection）。更新活动 BBR 连接时，新的边界会立即刷新
-pacing 状态并请求一次 send flush；修改 Configuration 仍只影响之后使用该
-Configuration 的连接。
+BBR 连接（started BBR connection）。更新活动 BBR 连接且边界值实际变化时，新的
+边界会立即刷新 pacing 状态并请求一次 send flush；修改 Configuration 仍只影响
+之后使用该 Configuration 的连接。
 
 min/max 均为 per-connection、local-send、directional 设置，各端独立配置，不会
 聚合多个连接，也不会配置 peer。它们只在 BBR 且 pacing enabled 时参与 pacing

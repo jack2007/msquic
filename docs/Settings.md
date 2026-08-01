@@ -129,8 +129,8 @@ For more details see [QUIC_SETTINGS](./api/QUIC_SETTINGS.md).
 的 sender，不会聚合多个连接，也不会配置 peer。Configuration 上的变更只影响
 之后使用该 Configuration 的连接。对具体 connection 使用
 `QUIC_PARAM_CONN_SETTINGS` 时，启动前和已启动的 BBR 连接（started BBR connection）
-都可以设置 min/max。活动 BBR 上成功更新后，MsQuic 会立即刷新其
-pacing 状态并请求一次 send flush。
+都可以设置 min/max。活动 BBR 上成功更新且边界值实际变化时，MsQuic 会立即刷新
+其 pacing 状态并请求一次 send flush。
 
 部分更新会与连接当前的另一侧边界合并成候选 min/max，并在写入任何一侧之前完成
 原子校验。双非零且 min 大于 max 时，`SetParam` 返回
@@ -141,12 +141,15 @@ pacing 状态并请求一次 send flush。
 bootstrap、ACK-only 或 recovery/bypass traffic 的短时突发；min 只提高基于时间的
 pacing allowance，不能绕过 congestion/recovery window、bytes in flight 或 flow
 control。应用供数和实际链路能力仍然是限制条件，所以 min 是 soft pacing floor，
-不是吞吐 SLA。两者都不修改 raw BBR bandwidth estimator、cwnd、BBR state、peer
-behavior 或 wire protocol。
+不是吞吐 SLA。两者都不修改 raw BBR bandwidth estimator、cwnd、BBR state
+machine、recovery state、peer behavior 或 wire protocol；热更新时，rate limiter
+内部的 initialized/budget/remainder 状态会按新边界刷新、清零或 clamp。
 
-preview `QUIC_NETWORK_STATISTICS` 区分四个值：raw `Bandwidth`、configured
-`MinPacingRateBytesPerSecond`、configured `MaxPacingRateBytesPerSecond`，以及应用
-边界后的 `EffectivePacingRateBytesPerSecond`。min 追加在结构尾部：使用
+active BBR 的 preview `QUIC_NETWORK_STATISTICS` 区分四个值：raw `Bandwidth`、
+configured `MinPacingRateBytesPerSecond`、configured
+`MaxPacingRateBytesPerSecond`，以及应用边界后的
+`EffectivePacingRateBytesPerSecond`。当前 Cubic statistics 只填充其 controller
+派生的 `Bandwidth`，追加的三个 rate 字段保持 `0`。min 追加在结构尾部：使用
 `QUIC_NETWORK_STATISTICS_SIZE_1` 的旧调用方仍只读取到 effective 字段，使用
 `QUIC_NETWORK_STATISTICS_SIZE_2` 或完整结构大小的调用方才读取 min。
 
