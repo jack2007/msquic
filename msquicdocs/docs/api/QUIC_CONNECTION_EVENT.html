@@ -443,17 +443,35 @@
 <p><code>CongestionWindow</code></p>
 <p>Congestion Window</p>
 <p><code>Bandwidth</code></p>
-<p>Raw BBR bandwidth estimate, in bytes per second. This value is not clamped by
-<code>MaxPacingRateBytesPerSecond</code>.</p>
+<p>active BBR 下，该字段是原始 BBR bandwidth estimator 的结果，单位为 bytes/s，
+不会被 <code>MinPacingRateBytesPerSecond</code> 或 <code>MaxPacingRateBytesPerSecond</code> 修改或
+clamp。其他 congestion controller 使用各自的统计实现；当前 Cubic 返回由
+<code>CongestionWindow / SmoothedRTT</code> 派生的值，它不是 raw BBR estimate，不应按 BBR
+语义解释。</p>
 <p><code>MaxPacingRateBytesPerSecond</code></p>
-<p>Configured maximum pacing rate for the local sender on this connection, in
-bytes per second. Zero means that no maximum is configured. This is the value
-captured when the new connection consumes its Configuration or pre-start
-connection settings; it is not a live view of later Configuration changes.</p>
+<p>active BBR 下，这是本连接本端 sender 当前配置的最大 pacing rate，单位为
+bytes/s；<code>0</code> 表示未启用 soft cap。通过 <code>QUIC_PARAM_CONN_SETTINGS</code> 对活动 BBR
+成功热更新后，后续统计会报告更新后的值；修改 Configuration 不会反向改变既有
+连接。当前 Cubic statistics 实现不填充追加的 rate 字段，因此该字段保持为 <code>0</code>，
+即使 connection settings 中保存了边界值也不表示 Cubic 应用了该上限。</p>
 <p><code>EffectivePacingRateBytesPerSecond</code></p>
-<p>Effective local BBR pacing rate after applying the configured maximum, in
-bytes per second. This is distinct from both the raw <code>Bandwidth</code> estimate and
-the configured maximum.</p>
+<p>active BBR 下，这是本连接本端 BBR 在应用 configured min/max 后使用的 effective
+pacing rate，单位为 bytes/s。它与 raw <code>Bandwidth</code> 和两个 configured bound 是
+不同含义的统计值。若 pacing disabled，min/max 不参与该值计算。当前 Cubic
+statistics 实现不填充该字段，因此返回 <code>0</code>。</p>
+<p><code>MinPacingRateBytesPerSecond</code></p>
+<p>active BBR 下，这是本连接本端 sender 当前配置的最小 pacing rate，单位为
+bytes/s；<code>0</code> 表示未启用 soft pacing floor。该 floor 不绕过 congestion control、
+recovery window、bytes in flight 或 flow control，因而不能视为吞吐 SLA。当前
+Cubic statistics 实现不填充追加的 rate 字段，因此该字段保持为 <code>0</code>。</p>
+<p><code>MinPacingRateBytesPerSecond</code> 追加在结构尾部。传入
+<code>QUIC_NETWORK_STATISTICS_SIZE_1</code> 的旧调用方仍会获得截至
+<code>EffectivePacingRateBytesPerSecond</code> 的原有字段，MsQuic 不会越界写入 min；传入
+<code>QUIC_NETWORK_STATISTICS_SIZE_2</code> 或 <code>sizeof(QUIC_NETWORK_STATISTICS)</code> 才会获得
+min 字段。成功返回时，写入字节数和返回的 <code>*StatsLength</code> 均不超过调用方提供的
+buffer 长度。若输入长度小于 <code>QUIC_NETWORK_STATISTICS_SIZE_1</code>，接口不写入
+statistics，返回 <code>QUIC_STATUS_BUFFER_TOO_SMALL</code>，并将 <code>*StatsLength</code> 设置为完整
+<code>QUIC_NETWORK_STATISTICS</code> 所需大小；此时该 required size 可以大于输入长度。</p>
 <h1 id="see-also">See Also</h1>
 <p><a href="ConnectionOpen.html">ConnectionOpen</a><br>
 <a href="QUIC_CONNECTION_CALLBACK.html">QUIC_CONNECTION_CALLBACK</a><br>
