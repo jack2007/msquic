@@ -443,7 +443,17 @@
 <p><code>CongestionWindow</code></p>
 <p>Congestion Window</p>
 <p><code>Bandwidth</code></p>
-<p>Estimated bandwidth</p>
+<p>Raw BBR bandwidth estimate, in bytes per second. This value is not clamped by
+<code>MaxPacingRateBytesPerSecond</code>.</p>
+<p><code>MaxPacingRateBytesPerSecond</code></p>
+<p>Configured maximum pacing rate for the local sender on this connection, in
+bytes per second. Zero means that no maximum is configured. This is the value
+captured when the new connection consumes its Configuration or pre-start
+connection settings; it is not a live view of later Configuration changes.</p>
+<p><code>EffectivePacingRateBytesPerSecond</code></p>
+<p>Effective local BBR pacing rate after applying the configured maximum, in
+bytes per second. This is distinct from both the raw <code>Bandwidth</code> estimate and
+the configured maximum.</p>
 <h1 id="see-also">See Also</h1>
 <p><a href="ConnectionOpen.html">ConnectionOpen</a><br>
 <a href="QUIC_CONNECTION_CALLBACK.html">QUIC_CONNECTION_CALLBACK</a><br>
