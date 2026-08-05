@@ -188,8 +188,12 @@ clog_stdout(struct clog_param ** head, const char * format, ...)
 
 #endif
 
-#if defined(QUIC_EVENTS_STDOUT) || defined(QUIC_LOGS_STUB)
+#if defined(QUIC_EVENTS_STDOUT) || defined(QUIC_EVENTS_STUB)
+#if defined(QUIC_EVENTS_STDOUT)
 #define QuicTraceEventEnabled(Name) TRUE
+#else
+#define QuicTraceEventEnabled(Name) FALSE
+#endif
 
 #define QuicTrace(Name, Fmt, ...)                                              \
     clog((Fmt " [" #Name ":%s:%d]\n"), ##__VA_ARGS__, __FILE__, __LINE__)
@@ -285,10 +289,19 @@ QuicEtwCallback(
 
 #if defined(QUIC_LOGS_STDOUT) || defined(QUIC_LOGS_STUB)
 
+#if defined(QUIC_LOGS_STDOUT)
 #define QuicTraceLogErrorEnabled() TRUE
 #define QuicTraceLogWarningEnabled() TRUE
 #define QuicTraceLogInfoEnabled() TRUE
 #define QuicTraceLogVerboseEnabled() TRUE
+#define QuicTraceLogStreamVerboseEnabled() TRUE
+#else
+#define QuicTraceLogErrorEnabled() FALSE
+#define QuicTraceLogWarningEnabled() FALSE
+#define QuicTraceLogInfoEnabled() FALSE
+#define QuicTraceLogVerboseEnabled() FALSE
+#define QuicTraceLogStreamVerboseEnabled() FALSE
+#endif
 
 #define QuicTraceLogError(Name, Fmt, ...) QuicTrace(Name, Fmt, ##__VA_ARGS__)
 #define QuicTraceLogWarning(Name, Fmt, ...) QuicTrace(Name, Fmt, ##__VA_ARGS__)
@@ -315,8 +328,6 @@ QuicEtwCallback(
         UNREFERENCED_PARAMETER(X);                                             \
         QuicTrace(Name, Fmt, ##__VA_ARGS__);                                   \
     } while (0)
-
-#define QuicTraceLogStreamVerboseEnabled() TRUE
 
 #define QuicTraceLogStreamError(Name, X, Fmt, ...)                             \
     QuicTrace(Name, Fmt, ##__VA_ARGS__)
