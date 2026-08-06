@@ -9,13 +9,31 @@ Abstract:
 
 --*/
 
+#define QuicLossDetectionInitialize QuicLossDetectionInitializeCpp
+#define QuicLossDetectionUninitialize QuicLossDetectionUninitializeCpp
+#define QuicLossDetectionOnPacketSent QuicLossDetectionOnPacketSentCpp
+#define QuicSentPacketPoolInitialize QuicSentPacketPoolInitializeCpp
+#define QuicSentPacketPoolUninitialize QuicSentPacketPoolUninitializeCpp
 #include "main.h"
+#undef QuicLossDetectionInitialize
+#undef QuicLossDetectionUninitialize
+#undef QuicLossDetectionOnPacketSent
+#undef QuicSentPacketPoolInitialize
+#undef QuicSentPacketPoolUninitialize
 #ifdef QUIC_CLOG
 #include "BbrTest.cpp.clog.h"
 #endif
 
 extern "C" {
 void BbrCongestionControlInitialize(QUIC_CONGESTION_CONTROL* Cc, const QUIC_SETTINGS_INTERNAL* Settings);
+void QuicLossDetectionInitialize(QUIC_LOSS_DETECTION* LossDetection);
+void QuicLossDetectionUninitialize(QUIC_LOSS_DETECTION* LossDetection);
+void QuicLossDetectionOnPacketSent(
+    QUIC_LOSS_DETECTION* LossDetection,
+    QUIC_PATH* Path,
+    QUIC_SENT_PACKET_METADATA* TempSentPacket);
+void QuicSentPacketPoolInitialize(QUIC_SENT_PACKET_POOL* Pool);
+void QuicSentPacketPoolUninitialize(QUIC_SENT_PACKET_POOL* Pool);
 uint64_t BbrCongestionControlGetBandwidth(const QUIC_CONGESTION_CONTROL* Cc);
 uint64_t BbrCongestionControlGetEffectivePacingRate(const QUIC_CONGESTION_CONTROL* Cc);
 uint32_t BbrCongestionControlGetCongestionWindow(const QUIC_CONGESTION_CONTROL* Cc);
@@ -1257,6 +1275,73 @@ TEST_F(BbrTest_DeepTest, SetAppLimited_BelowCW)
     InitializeWithDefaults();
     CC->QuicCongestionControlSetAppLimited(CC);
     ASSERT_TRUE(CC->QuicCongestionControlIsAppLimited(CC));
+}
+
+TEST_F(BbrTest_DeepTest, LossDetection_EmptySendStreamsMarksControlPacketAppLimited)
+{
+    InitializeWithDefaults();
+    CxPlatListInitializeHead(&Connection.Send.SendStreams);
+
+    QUIC_PARTITION Partition{};
+    QuicSentPacketPoolInitialize(&Partition.SentPacketPool);
+    Connection.Partition = &Partition;
+    QuicLossDetectionInitialize(&Connection.LossDetection);
+
+    QUIC_MAX_SENT_PACKET_METADATA Packet{};
+    Packet.Metadata.PacketNumber = 1;
+    Packet.Metadata.PacketLength = 64;
+    Packet.Metadata.SentTime = 1000;
+    Packet.Metadata.Flags.KeyType = QUIC_PACKET_KEY_1_RTT;
+    Packet.Metadata.FrameCount = 1;
+    Packet.Metadata.Frames[0].Type = QUIC_FRAME_ACK;
+
+    QuicLossDetectionOnPacketSent(
+        &Connection.LossDetection,
+        &Connection.Paths[0],
+        &Packet.Metadata);
+
+    QUIC_SENT_PACKET_METADATA* SentPacket = Connection.LossDetection.SentPackets;
+    EXPECT_NE(nullptr, SentPacket);
+    if (SentPacket != nullptr) {
+        EXPECT_TRUE(SentPacket->Flags.IsAppLimited);
+    }
+
+    QuicLossDetectionUninitialize(&Connection.LossDetection);
+    QuicSentPacketPoolUninitialize(&Partition.SentPacketPool);
+}
+
+TEST_F(BbrTest_DeepTest, LossDetection_PendingDatagramIsNotAppLimited)
+{
+    InitializeWithDefaults();
+    CxPlatListInitializeHead(&Connection.Send.SendStreams);
+    Connection.Send.SendFlags |= QUIC_CONN_SEND_FLAG_DATAGRAM;
+
+    QUIC_PARTITION Partition{};
+    QuicSentPacketPoolInitialize(&Partition.SentPacketPool);
+    Connection.Partition = &Partition;
+    QuicLossDetectionInitialize(&Connection.LossDetection);
+
+    QUIC_MAX_SENT_PACKET_METADATA Packet{};
+    Packet.Metadata.PacketNumber = 1;
+    Packet.Metadata.PacketLength = 64;
+    Packet.Metadata.SentTime = 1000;
+    Packet.Metadata.Flags.KeyType = QUIC_PACKET_KEY_1_RTT;
+    Packet.Metadata.FrameCount = 1;
+    Packet.Metadata.Frames[0].Type = QUIC_FRAME_ACK;
+
+    QuicLossDetectionOnPacketSent(
+        &Connection.LossDetection,
+        &Connection.Paths[0],
+        &Packet.Metadata);
+
+    QUIC_SENT_PACKET_METADATA* SentPacket = Connection.LossDetection.SentPackets;
+    EXPECT_NE(nullptr, SentPacket);
+    if (SentPacket != nullptr) {
+        EXPECT_FALSE(SentPacket->Flags.IsAppLimited);
+    }
+
+    QuicLossDetectionUninitialize(&Connection.LossDetection);
+    QuicSentPacketPoolUninitialize(&Partition.SentPacketPool);
 }
 
 //

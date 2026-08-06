@@ -464,7 +464,10 @@ QuicLossDetectionOnPacketSent(
     if (SendPostedBytes < Path->Mtu &&
         QuicCongestionControlCanSend(&Connection->CongestionControl) &&
         !QuicCryptoHasPendingCryptoFrame(&Connection->Crypto) &&
-        (Stream && QuicStreamAllowedByPeer(Stream)) && !QuicStreamCanSendNow(Stream, FALSE)) {
+        (Connection->Send.SendFlags & QUIC_CONN_SEND_FLAG_DATAGRAM) == 0 &&
+        (Stream == NULL ||
+            (QuicStreamAllowedByPeer(Stream) &&
+             !QuicStreamCanSendNow(Stream, FALSE)))) {
         QuicCongestionControlSetAppLimited(&Connection->CongestionControl);
     }
 
