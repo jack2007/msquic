@@ -218,7 +218,7 @@ typedef struct QUIC_CONGESTION_CONTROL_BBR {
     BBR_BANDWIDTH_FILTER BandwidthFilter;
 
     //
-    // Bounded byte credit for the configured per-connection pacing-rate cap.
+    // Bounded byte credit for adaptive/configured BBR pacing.
     //
     BOOLEAN RateLimitInitialized;
     uint64_t RateLimitBudgetBytes;
