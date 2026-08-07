@@ -629,6 +629,8 @@ BbrCongestionControlOnDataSent(
                 NumRetransmittableBytes >= Bbr->RateLimitBudgetBytes ?
                     0 : Bbr->RateLimitBudgetBytes - NumRetransmittableBytes;
         }
+    } else {
+        BbrCongestionControlClearRateLimitBudget(Cc);
     }
 
     if (!Bbr->BytesInFlight && BbrCongestionControlIsAppLimited(Cc)) {
@@ -918,6 +920,7 @@ BbrCongestionControlGetSendAllowance(
     const uint32_t CongestionAllowance =
         CongestionWindow - Bbr->BytesInFlight;
     if (!Connection->Settings.PacingEnabled) {
+        BbrCongestionControlClearRateLimitBudget(Cc);
         return CongestionAllowance;
     }
 
