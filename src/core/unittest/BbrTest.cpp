@@ -619,32 +619,25 @@ TEST_F(BbrTest_DeepTest, OnDataAcknowledged_MinRttNoUpdate)
 }
 
 //
-// Test: OnDataAcknowledged - Refresh MinRtt After Persistent Path Change
-// Scenario: A persistent connection fully drains while the path RTT changes from
-// 1ms to 50ms. The application-limited flag is not guaranteed to be set by the
-// transport integration, so the RTT shift itself must refresh the stale sample.
+// Test: OnDataAcknowledged - Large Queueing Sample Does Not Replace MinRtt
+// Scenario: A large queueing sample arrives before the current MinRtt expires.
+// BBR must keep the lower propagation-delay baseline and its timestamp.
 //
-TEST_F(BbrTest_DeepTest, OnDataAcknowledged_RefreshMinRttAfterPersistentPathChange)
+TEST_F(BbrTest_DeepTest, OnDataAcknowledged_LargeQueueingSampleDoesNotReplaceMinRtt)
 {
     InitializeWithDefaults();
 
     CC->QuicCongestionControlOnDataSent(CC, 5000);
-    QUIC_ACK_EVENT Ack1 = MakeBbrAckEvent(1000000, 1, 2, 1200, 1100, 1000, TRUE);
-    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack1);
+    auto First = MakeBbrAckEvent(1000000, 1, 2, 1200, 1100, 1000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &First);
     ASSERT_EQ(Bbr->MinRtt, 1000u);
 
-    uint32_t Remaining = Bbr->BytesInFlight;
-    QUIC_ACK_EVENT AckAll = MakeBbrAckEvent(1050000, 3, 4, Remaining, 1100, 1000, TRUE);
-    CC->QuicCongestionControlOnDataAcknowledged(CC, &AckAll);
-    ASSERT_EQ(Bbr->BytesInFlight, 0u);
+    CC->QuicCongestionControlOnDataSent(CC, 1200);
+    auto Queued = MakeBbrAckEvent(1100000, 3, 4, 1200, 52000, 50000, TRUE);
+    CC->QuicCongestionControlOnDataAcknowledged(CC, &Queued);
 
-    CC->QuicCongestionControlOnDataSent(CC, 5000);
-    ASSERT_FALSE(Bbr->ExitingQuiescence);
-
-    QUIC_ACK_EVENT Ack2 = MakeBbrAckEvent(1100000, 5, 6, 1200, 52000, 50000, TRUE);
-    CC->QuicCongestionControlOnDataAcknowledged(CC, &Ack2);
-
-    ASSERT_EQ(Bbr->MinRtt, 50000u);
+    ASSERT_EQ(Bbr->MinRtt, 1000u);
+    ASSERT_EQ(Bbr->MinRttTimestamp, 1000000u);
 }
 
 //

@@ -107,13 +107,6 @@ const uint32_t kProbeRttTimeInUs = 200 * 1000;
 //
 const uint32_t kBbrMinRttExpirationInMicroSecs = S_TO_US(20);
 
-//
-// A persistent connection can resume on a materially different path while its
-// previous MinRtt sample is still valid. Require a large increase in both the
-// minimum and smoothed RTT before replacing that sample.
-//
-const uint32_t kPathRttChangeFactor = 4;
-
 const uint32_t kBbrMaxBandwidthFilterLen = 10;
 
 const uint32_t kBbrMaxAckHeightFilterLen = 10;
@@ -1094,17 +1087,10 @@ BbrCongestionControlOnDataAcknowledged(
         Bbr->RttSampleExpired = Bbr->MinRttTimestampValid ?
            CxPlatTimeAtOrBefore64(Bbr->MinRttTimestamp + kBbrMinRttExpirationInMicroSecs, AckEvent->TimeNow) :
            FALSE;
-        BOOLEAN PathRttChanged =
-            Bbr->MinRttTimestampValid &&
-            AckEvent->MinRtt / kPathRttChangeFactor >= Bbr->MinRtt &&
-            AckEvent->SmoothedRtt / kPathRttChangeFactor >= Bbr->MinRtt;
-        if (Bbr->RttSampleExpired || Bbr->MinRtt > AckEvent->MinRtt || PathRttChanged) {
+        if (Bbr->RttSampleExpired || Bbr->MinRtt > AckEvent->MinRtt) {
             Bbr->MinRtt = AckEvent->MinRtt;
             Bbr->MinRttTimestamp = AckEvent->TimeNow;
             Bbr->MinRttTimestampValid = TRUE;
-            if (PathRttChanged) {
-                Bbr->RttSampleExpired = FALSE;
-            }
         }
     }
 
