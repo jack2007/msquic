@@ -913,6 +913,9 @@ BbrCongestionControlGetSendAllowance(
     QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
     const uint32_t CongestionWindow =
         BbrCongestionControlGetCongestionWindow(Cc);
+    if (!Connection->Settings.PacingEnabled) {
+        BbrCongestionControlClearRateLimitBudget(Cc);
+    }
     if (Bbr->BytesInFlight >= CongestionWindow) {
         return 0;
     }
@@ -920,7 +923,6 @@ BbrCongestionControlGetSendAllowance(
     const uint32_t CongestionAllowance =
         CongestionWindow - Bbr->BytesInFlight;
     if (!Connection->Settings.PacingEnabled) {
-        BbrCongestionControlClearRateLimitBudget(Cc);
         return CongestionAllowance;
     }
 

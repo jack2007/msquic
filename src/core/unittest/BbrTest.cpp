@@ -2566,6 +2566,32 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledSendClearsState)
     ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
 }
 
+TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledBlockedAllowanceClearsState)
+{
+    constexpr uint64_t RateBytesPerSecond = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
+    SetBandwidthBytesPerSecond(RateBytesPerSecond);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    const uint32_t Datagram =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+
+    ASSERT_EQ(Datagram, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    CC->QuicCongestionControlOnDataSent(CC, Datagram);
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 3, TRUE));
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(1u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(RateBytesPerSecond, Bbr->RateLimitRemainderNumerator);
+
+    Bbr->BytesInFlight = Bbr->CongestionWindow;
+    Connection.Settings.PacingEnabled = FALSE;
+
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
+}
+
 TEST_F(BbrTest_DeepTest, RateLimitBootstrapsWithoutBandwidthSample)
 {
     InitializeWithDefaults(10, 1280, true, false, 125);
