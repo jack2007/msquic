@@ -67,6 +67,8 @@ const uint64_t kLowPacingRateThresholdBytesPerSecond = 1200ULL * 1000;
 
 const uint64_t kHighPacingRateThresholdBytesPerSecond = 24ULL * 1000 * 1000;
 
+const uint32_t kRateLimitBudgetMaxPacingIntervals = 2;
+
 const uint32_t kHighGain = GAIN_UNIT * 2885 / 1000 + 1; // 2/ln(2)
 
 const uint32_t kDrainGain = GAIN_UNIT * 1000 / 2885; // 1/kHighGain
@@ -812,7 +814,8 @@ BbrCongestionControlGetRateLimitBurstCapacity(
     const uint64_t PacingQuantumBytes =
         BbrSaturatingMultiplyDivideCeil(
             Rate,
-            QUIC_SEND_PACING_INTERVAL,
+            (uint64_t)QUIC_SEND_PACING_INTERVAL *
+                kRateLimitBudgetMaxPacingIntervals,
             kMicroSecsInSec);
     const uint64_t BurstCapacity =
         CXPLAT_MAX((uint64_t)DatagramPayloadLength, PacingQuantumBytes);
