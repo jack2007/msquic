@@ -1518,7 +1518,8 @@ TEST_F(BbrTest_DeepTest, GetTargetCwnd_NoMinRttSample)
 
 //
 // Test: GetSendAllowance - MinRtt Below QUIC_SEND_PACING_INTERVAL
-// Scenario: A sub-millisecond MinRtt must not bypass the adaptive pacing budget.
+// Scenario: Sub-ms MinRtt skips time-based pacing and returns CWND remaining.
+// Max=0 → RateLimitBudget stays inactive.
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_MinRttBelowPacingInterval)
 {
@@ -1528,12 +1529,11 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_MinRttBelowPacingInterval)
     Bbr->PacingGain = 256;
     Bbr->MinRttTimestampValid = TRUE;
     Bbr->MinRtt = 500;
-    const uint32_t DatagramPayload =
-        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
     ASSERT_EQ(
-        DatagramPayload + 12500u,
+        Bbr->CongestionWindow - Bbr->BytesInFlight,
         CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
 }
 
 //
@@ -1551,12 +1551,13 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_StartupPacing)
     ASSERT_EQ(Bbr->BbrState, (uint32_t)BBR_STATE_STARTUP);
 
     uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
-    ASSERT_EQ(Bbr->CongestionWindow - Bbr->BytesInFlight, Allowance);
+    // Startup burst is large, but Layer A still applies the CWND/4 pacing cap.
+    ASSERT_EQ(Bbr->CongestionWindow >> 2, Allowance);
     ASSERT_FALSE(Bbr->RateLimitInitialized);
 }
 
 //
-// Test: GetSendAllowance - the bounded pacing budget replaces the old CW/4 cap.
+// Test: GetSendAllowance - CWND/4 caps long idle when Max=0 (no RateLimit).
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_CappedByQuarter)
 {
@@ -1564,15 +1565,17 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_CappedByQuarter)
     SetBandwidthBytesPerSecond(12500000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
 
     const uint32_t Allowance =
         CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE);
-    ASSERT_EQ(25000u, Allowance);
-    ASSERT_NE(Bbr->CongestionWindow >> 2, Allowance);
+    ASSERT_EQ(Bbr->CongestionWindow >> 2, Allowance);
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
 }
 
 //
-// Test: GetSendAllowance - PROBE_BW retains bootstrap plus elapsed-time credit.
+// Test: GetSendAllowance - PROBE_BW with Max=0 uses CWND/time (CWND/4 cap).
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_NonStartupPacing)
 {
@@ -1580,12 +1583,13 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_NonStartupPacing)
     SetBandwidthBytesPerSecond(12500000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
-    const uint32_t DatagramPayload =
-        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
 
     ASSERT_EQ(
-        DatagramPayload + 12500u,
+        Bbr->CongestionWindow >> 2,
         CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
 }
 
 TEST_F(BbrTest_DeepTest, Initialize_DefaultState)
@@ -2388,18 +2392,71 @@ TEST_F(BbrTest_DeepTest, SetExemption_Zero)
 }
 
 //
-// Per-connection BBR pacing-rate cap tests.
+// Per-connection BBR min/max soft pacing-rate tests.
+// RateLimitBudget is only active when MaxPacingRate != 0.
 //
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetAt100MbpsWithoutConfiguredBounds)
+TEST_F(BbrTest_DeepTest, MaxZeroSkipsRateLimitBudget)
 {
-    constexpr uint64_t RateBytesPerSecond = 12500000; // 100 Mbps
+    constexpr uint64_t BandwidthBytesPerSecond = 12500000; // 100 Mbps
     InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
+    SetBandwidthBytesPerSecond(BandwidthBytesPerSecond);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
     Bbr->MinRttTimestampValid = TRUE;
-    Bbr->MinRtt = 500;
+    Bbr->MinRtt = 5000;
+
+    ASSERT_EQ(
+        Bbr->CongestionWindow >> 2,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+}
+
+TEST_F(BbrTest_DeepTest, MaxZeroLongIdleUsesCwndQuarterCap)
+{
+    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
+    SetBandwidthBytesPerSecond(12500000);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
+
+    ASSERT_EQ(
+        Bbr->CongestionWindow >> 2,
+        CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+}
+
+TEST_F(BbrTest_DeepTest, MinSoftFloorRaisesAllowanceWithinCwnd)
+{
+    // Tiny BBR estimate + CWND/4 would be large; Min alone is enough to show
+    // the floor path when time-pacing credit is zeroed by invalid MinRtt path
+    // after a sub-ms MinRtt, then restored — use Max=0 and compare Min vs no Min
+    // with BW=1 so Layer A time credit truncates without the Min floor.
+    InitializeWithDefaults(2000, 1280, true, false, 0, 12500000);
+    SetBandwidthBytesPerSecond(1);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
+
+    ASSERT_EQ(
+        12500u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+}
+
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingTokenBucketAtConfiguredMax)
+{
+    constexpr uint64_t MaxBytesPerSecond = 12500000; // 100 Mbps
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    // BBR would allow more than Max; Layer C must clamp via Max token bucket.
+    SetBandwidthBytesPerSecond(50000000);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000; // BurstCapacity = Max × 5ms = 62500
     const uint32_t DatagramPayload =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
@@ -2410,73 +2467,129 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetAt100MbpsWithoutConfiguredBounds)
     ASSERT_EQ(DatagramPayload + 12500u, Bbr->RateLimitBudgetBytes);
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetCapsLongIdleWithoutConfiguredMax)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingBurstUsesMinRttWindow)
 {
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(12500000);
+    constexpr uint64_t MaxBytesPerSecond = 1000000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
-
-    ASSERT_EQ(
-        25000u,
-        CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE));
-}
-
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetSupportsCoarseFlushCadence)
-{
-    constexpr uint64_t RateBytesPerSecond = 12500000; // 100 Mbps
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
-    Bbr->BbrState = BBR_STATE_PROBE_BW;
-    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 10000; // 10ms → BurstCapacity = 10000 bytes
     const uint32_t DatagramPayload =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
-
-    ASSERT_EQ(
-        DatagramPayload,
-        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
-    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
-    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
-
-    ASSERT_EQ(
-        18750u,
-        CC->QuicCongestionControlGetSendAllowance(CC, 1500, TRUE));
-    ASSERT_EQ(18750u, Bbr->RateLimitBudgetBytes);
-}
-
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetHasNoAbsoluteOneGbpsFloor)
-{
-    constexpr uint64_t RateBytesPerSecond = 1000000;
-    constexpr uint32_t TwoMillisecondCapacity = 2000;
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
-    Bbr->BbrState = BBR_STATE_PROBE_BW;
-    Bbr->PacingGain = 256;
-    const uint32_t DatagramPayload =
-        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
-    ASSERT_LT(DatagramPayload, TwoMillisecondCapacity);
+    ASSERT_LT(DatagramPayload, 10000u);
     CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
 
     ASSERT_EQ(
-        TwoMillisecondCapacity,
+        10000u,
         CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE));
-    ASSERT_EQ(TwoMillisecondCapacity, Bbr->RateLimitBudgetBytes);
+    ASSERT_EQ(10000u, Bbr->RateLimitBudgetBytes);
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetQuiescenceUsesUnityGain)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingDebitsBudget)
 {
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(12500000);
+    constexpr uint64_t MaxBytesPerSecond = 12500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
-    Bbr->PacingGain = 320;
-    CC->QuicCongestionControlSetAppLimited(CC);
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    const uint32_t InitialAllowance = DatagramPayload + 12500u;
+    ASSERT_EQ(
+        InitialAllowance,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+
+    CC->QuicCongestionControlOnDataSent(CC, 5000);
+
+    ASSERT_EQ(InitialAllowance - 5000u, Bbr->RateLimitBudgetBytes);
+    // dt=0 → Layer A time credit is 0; remaining token-bucket credit is kept.
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
+    ASSERT_EQ(InitialAllowance - 5000u, Bbr->RateLimitBudgetBytes);
+    // dt=1ms refills Max×1ms on top of the remaining budget.
+    ASSERT_EQ(
+        InitialAllowance - 5000u + 12500u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+}
+
+//
+// Test: CC-blocked prepares must still refill Max tokens. packet_builder advances
+// LastFlushTime even when allowance is 0; skipping refill permanently burns Max
+// credit and under-delivers the soft ceiling in steady state.
+//
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingRefillsWhileCongestionBlocked)
+{
+    constexpr uint64_t MaxBytesPerSecond = 12500000; // 100 Mbps
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000; // BurstCapacity = Max × 5ms = 62500
     const uint32_t DatagramPayload =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
     ASSERT_EQ(
         DatagramPayload + 12500u,
         CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
-    ASSERT_EQ(320u, Bbr->PacingGain);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload + 12500u);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+
+    Bbr->BytesInFlight = Bbr->CongestionWindow;
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(12500u, Bbr->RateLimitBudgetBytes);
+
+    // Unblock CC: accumulated Max tokens remain available immediately.
+    Bbr->BytesInFlight = 0;
+    ASSERT_EQ(
+        12500u + 12500u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingAccumulatesFractionalCredit)
+{
+    constexpr uint64_t MaxBytesPerSecond = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    // High BBR bandwidth so Layer A is not the limiter once the bucket fills.
+    SetBandwidthBytesPerSecond(5000000000ULL);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
+    const uint32_t Datagram =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+    ASSERT_EQ(Datagram, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    CC->QuicCongestionControlOnDataSent(CC, Datagram);
+    const uint64_t CallsBeforeFull =
+        ((uint64_t)Datagram * 1000000ULL / MaxBytesPerSecond) - 1;
+    for (uint64_t i = 0; i < CallsBeforeFull; ++i) {
+        ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
+    }
+    ASSERT_EQ(Datagram, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
+}
+
+TEST_F(BbrTest_DeepTest, MinAndMaxSoftLimitsCompose)
+{
+    // Min raises time-pacing; Max token bucket still caps the result.
+    InitializeWithDefaults(2000, 1280, true, false, 6250000, 12500000);
+    SetBandwidthBytesPerSecond(1000000);
+    Bbr->BbrState = BBR_STATE_PROBE_BW;
+    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
+    const uint32_t DatagramPayload =
+        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
+
+    // Min × 1ms = 12500, but Max refill from datagram bootstrap + Max×1ms:
+    // budget starts at datagram, refill adds 6250 → datagram+6250.
+    ASSERT_EQ(
+        DatagramPayload + 6250u,
+        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
 }
 
 TEST_F(BbrTest_DeepTest, QuiescenceExitResetsAckAggregationEpoch)
@@ -2493,81 +2606,42 @@ TEST_F(BbrTest_DeepTest, QuiescenceExitResetsAckAggregationEpoch)
     ASSERT_EQ(0u, Bbr->AggregatedAckBytes);
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDebitsWithoutConfiguredMax)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingRateChangesDoNotKeepExcessOrMintCredit)
 {
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(12500000);
+    constexpr uint64_t MaxBytesPerSecond = 12500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
-    const uint32_t DatagramPayload =
-        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
-    const uint32_t InitialAllowance = DatagramPayload + 12500u;
-    ASSERT_EQ(
-        InitialAllowance,
-        CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE));
-
-    CC->QuicCongestionControlOnDataSent(CC, 5000);
-
-    ASSERT_EQ(InitialAllowance - 5000u, Bbr->RateLimitBudgetBytes);
-    ASSERT_EQ(
-        InitialAllowance - 5000u,
-        CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
-}
-
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetAccumulatesFractionalCredit)
-{
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(500000);
-    Bbr->BbrState = BBR_STATE_PROBE_BW;
-    Bbr->PacingGain = 256;
-    const uint32_t Datagram =
-        QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
-    ASSERT_EQ(Datagram, CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
-    CC->QuicCongestionControlOnDataSent(CC, Datagram);
-    const uint64_t CallsBeforeFull =
-        ((uint64_t)Datagram * 1000000ULL / 500000ULL) - 1;
-    for (uint64_t i = 0; i < CallsBeforeFull; ++i) {
-        ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
-    }
-    ASSERT_EQ(Datagram, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
-}
-
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetZeroRateBootstrapsStartup)
-{
-    InitializeWithDefaults(10, 1280, true, false, 0, 0);
-    ASSERT_EQ(
-        Bbr->CongestionWindow,
-        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
-    ASSERT_FALSE(Bbr->RateLimitInitialized);
-}
-
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetRateChangesDoNotKeepExcessOrMintCredit)
-{
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(12500000);
-    Bbr->BbrState = BBR_STATE_PROBE_BW;
-    Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 2000; // BurstCapacity floor path: Max × 2ms = 25000
     ASSERT_EQ(
         25000u,
         CC->QuicCongestionControlGetSendAllowance(CC, UINT64_MAX, TRUE));
 
     Connection.Settings.MaxPacingRateBytesPerSecond = 6250000;
-    BbrCongestionControlOnPacingRateChanged(CC, 0);
+    BbrCongestionControlOnPacingRateChanged(CC, MaxBytesPerSecond);
     ASSERT_EQ(12500u, Bbr->RateLimitBudgetBytes);
 
     Connection.Settings.MaxPacingRateBytesPerSecond = 0;
     BbrCongestionControlOnPacingRateChanged(CC, 6250000);
-    ASSERT_EQ(12500u, Bbr->RateLimitBudgetBytes);
-    ASSERT_EQ(12500u, CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
+    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+    // Max cleared → CWND/time only; dt=0 yields 0 paced bytes → 0 after caps
+    // when MinRtt valid; with TimeSinceLastSend=0 invalid path isn't taken
+    // (valid=TRUE), so TimeAllowance=0 → SendAllowance=0.
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisableClearsStateAndReenableBootstraps)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingDisableClearsStateAndReenableBootstraps)
 {
-    constexpr uint64_t RateBytesPerSecond = 500000;
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
+    constexpr uint64_t MaxBytesPerSecond = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
     const uint32_t Datagram =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
@@ -2576,7 +2650,7 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisableClearsStateAndReenableBootst
     ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
     ASSERT_TRUE(Bbr->RateLimitInitialized);
     ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
-    ASSERT_EQ(RateBytesPerSecond, Bbr->RateLimitRemainderNumerator);
+    ASSERT_EQ(MaxBytesPerSecond, Bbr->RateLimitRemainderNumerator);
 
     Connection.Settings.PacingEnabled = FALSE;
     ASSERT_EQ(
@@ -2593,13 +2667,15 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisableClearsStateAndReenableBootst
     ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledSendClearsState)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingDisabledSendClearsState)
 {
-    constexpr uint64_t RateBytesPerSecond = 500000;
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
+    constexpr uint64_t MaxBytesPerSecond = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
     const uint32_t Datagram =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
@@ -2607,7 +2683,7 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledSendClearsState)
     CC->QuicCongestionControlOnDataSent(CC, Datagram);
     ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1, TRUE));
     ASSERT_TRUE(Bbr->RateLimitInitialized);
-    ASSERT_EQ(RateBytesPerSecond, Bbr->RateLimitRemainderNumerator);
+    ASSERT_EQ(MaxBytesPerSecond, Bbr->RateLimitRemainderNumerator);
 
     Connection.Settings.PacingEnabled = FALSE;
     CC->QuicCongestionControlOnDataSent(CC, 100);
@@ -2617,13 +2693,15 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledSendClearsState)
     ASSERT_EQ(0u, Bbr->RateLimitRemainderNumerator);
 }
 
-TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledBlockedAllowanceClearsState)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingDisabledBlockedAllowanceClearsState)
 {
-    constexpr uint64_t RateBytesPerSecond = 500000;
-    InitializeWithDefaults(2000, 1280, true, false, 0, 0);
-    SetBandwidthBytesPerSecond(RateBytesPerSecond);
+    constexpr uint64_t MaxBytesPerSecond = 500000;
+    InitializeWithDefaults(2000, 1280, true, false, MaxBytesPerSecond, 0);
+    SetBandwidthBytesPerSecond(50000000);
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingGain = 256;
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
     const uint32_t Datagram =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
@@ -2632,7 +2710,7 @@ TEST_F(BbrTest_DeepTest, AdaptivePacingBudgetDisabledBlockedAllowanceClearsState
     ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 3, TRUE));
     ASSERT_TRUE(Bbr->RateLimitInitialized);
     ASSERT_EQ(1u, Bbr->RateLimitBudgetBytes);
-    ASSERT_EQ(RateBytesPerSecond, Bbr->RateLimitRemainderNumerator);
+    ASSERT_EQ(MaxBytesPerSecond, Bbr->RateLimitRemainderNumerator);
 
     Bbr->BytesInFlight = Bbr->CongestionWindow;
     Connection.Settings.PacingEnabled = FALSE;
@@ -2704,13 +2782,18 @@ TEST_F(BbrTest_DeepTest, RateLimitCapsStartupCwndFastPath)
     PumpBandwidthSample(1050000, 1, 1200, 1000000, 45000);
     ASSERT_EQ(Bbr->BbrState, (uint32_t)BBR_STATE_STARTUP);
 
+    // Reset bucket so the measured call starts from a clean Max soft-cap bootstrap.
+    Bbr->RateLimitInitialized = FALSE;
+    Bbr->RateLimitBudgetBytes = 0;
+    Bbr->RateLimitRemainderNumerator = 0;
     const uint32_t Allowance =
         CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
-    ASSERT_EQ(DatagramPayload, Allowance);
+    ASSERT_EQ(DatagramPayload + 1250u, Allowance);
 
     CC->QuicCongestionControlReset(CC, TRUE);
     Bbr->MinRttTimestampValid = TRUE;
-    Bbr->MinRtt = 500; // Below QUIC_SEND_PACING_INTERVAL.
+    Bbr->MinRtt = 500; // Below QUIC_SEND_PACING_INTERVAL → full CWND path,
+                       // still clamped by Max token bucket bootstrap.
     ASSERT_EQ(
         DatagramPayload,
         CC->QuicCongestionControlGetSendAllowance(CC, 0, TRUE));
@@ -2726,12 +2809,20 @@ TEST_F(BbrTest_DeepTest, RateLimitCapsProbeBwHighGain)
     Bbr->BbrState = BBR_STATE_PROBE_BW;
     Bbr->PacingCycleIndex = 0;
     Bbr->PacingGain = 320; // ProbeBW 1.25 gain.
+    // Inflate BBR bandwidth so Layer A is not the limiter.
+    SetBandwidthBytesPerSecond(50000000);
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 45000;
     const uint32_t DatagramPayload =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
 
+    // High BBR gain must not inflate the Max soft-cap refill rate.
+    Bbr->RateLimitInitialized = FALSE;
+    Bbr->RateLimitBudgetBytes = 0;
+    Bbr->RateLimitRemainderNumerator = 0;
     const uint32_t Allowance =
         CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
-    ASSERT_EQ(DatagramPayload, Allowance);
+    ASSERT_EQ(DatagramPayload + 1250u, Allowance);
 }
 
 TEST_F(BbrTest_DeepTest, RateLimitRequiresFullDatagramCredit)
@@ -2862,26 +2953,33 @@ TEST_F(BbrTest_DeepTest, RateLimitCcExemptionStillMakesProgress)
             TRUE));
 }
 
-TEST_F(BbrTest_DeepTest, RateLimitZeroEffectiveRateDoesNotRefill)
+TEST_F(BbrTest_DeepTest, MaxSoftCeilingAppliesWhenBbrEffectiveRateIsZero)
 {
-    InitializeWithDefaults(10, 1280, true, false, 125);
+    // Max soft ceiling is independent of BBR estimated / effective rate.
+    constexpr uint64_t MaxRate = 125;
+    InitializeWithDefaults(10, 1280, true, false, MaxRate);
     const uint32_t DatagramPayload =
         QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
     QuicSlidingWindowExtremumUpdateMax(
         &Bbr->BandwidthFilter.WindowedMaxFilter, 8, 1); // Raw BW_UNIT = 1 B/s.
     Bbr->PacingGain = 192; // ProbeBW 0.75 gain floors the effective rate to zero.
+    Bbr->MinRttTimestampValid = TRUE;
+    Bbr->MinRtt = 5000;
 
     QUIC_NETWORK_STATISTICS Stats{};
     BbrCongestionControlGetNetworkStatistics(&Connection, CC, &Stats);
     ASSERT_EQ(1u, Stats.Bandwidth);
     ASSERT_EQ(0u, Stats.EffectivePacingRateBytesPerSecond);
 
-    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
     ASSERT_EQ(
-        Bbr->CongestionWindow - Bbr->BytesInFlight,
-        CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE));
-    ASSERT_FALSE(Bbr->RateLimitInitialized);
-    ASSERT_EQ(0u, Bbr->RateLimitBudgetBytes);
+        DatagramPayload,
+        CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE));
+    ASSERT_TRUE(Bbr->RateLimitInitialized);
+    CC->QuicCongestionControlOnDataSent(CC, DatagramPayload);
+    // After spending the bootstrap datagram, Max=125 B/s needs a full second
+    // to accumulate another datagram's worth of credit.
+    ASSERT_EQ(0u, CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE));
+    ASSERT_LT(Bbr->RateLimitBudgetBytes, DatagramPayload);
 }
 
 TEST_F(BbrTest_DeepTest, RateLimitArithmeticSaturatesSafely)
@@ -2953,7 +3051,10 @@ TEST_F(BbrTest_DeepTest, MinimumPacingRateCannotExceedCongestionWindow)
 
     const uint32_t Allowance =
         CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
-    ASSERT_EQ(BbrCongestionControlGetCongestionWindow(CC), Allowance);
+    // Soft Min may exceed CWND/4 but never CWND - BytesInFlight.
+    ASSERT_EQ(
+        BbrCongestionControlGetCongestionWindow(CC) - Bbr->BytesInFlight,
+        Allowance);
 }
 
 TEST_F(BbrTest_DeepTest, MinimumPacingRateRaisesTimeAllowance)
@@ -2978,9 +3079,11 @@ TEST_F(BbrTest_DeepTest, MinimumPacingRateRaisesTimeAllowance)
     const uint32_t RawAllowance =
         CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
 
-    ASSERT_EQ(RawAllowance + 10000u, FlooredAllowance);
-    ASSERT_EQ(QuicPathGetDatagramPayloadSize(&Connection.Paths[0]), RawAllowance);
-    ASSERT_GT(FlooredAllowance, RawAllowance);
+    // Upstream-style Layer A: stored BW units × gain × dt / GAIN (no /1e6).
+    // BW=1 B/s → unit 8 → 8000 B for 1ms; Min soft floor raises to 10000.
+    ASSERT_EQ(8000u, RawAllowance);
+    ASSERT_EQ(10000u, FlooredAllowance);
+    ASSERT_FALSE(Bbr->RateLimitInitialized);
 }
 
 TEST_F(BbrTest_DeepTest, PacingBoundsEffectiveRateMatrix)

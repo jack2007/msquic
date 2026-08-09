@@ -287,19 +287,18 @@ BbrCongestionControlGetEffectivePacingRate(
         Cc, Cc->Bbr.PacingGain);
 }
 
+//
+// Soft Max ceiling token-bucket refill rate. RateLimitBudget is only for the
+// configured MaxPacingRate soft cap — never BBR estimated bandwidth.
+//
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static uint64_t
 BbrCongestionControlGetRateLimitPacingRate(
     _In_ const QUIC_CONGESTION_CONTROL* Cc
     )
 {
-    const QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
-    const BOOLEAN Restart =
-        Bbr->BbrState == BBR_STATE_PROBE_BW &&
-        (Bbr->ExitingQuiescence ||
-         (Bbr->BytesInFlight == 0 && Bbr->BandwidthFilter.AppLimited));
-    return BbrCongestionControlGetEffectivePacingRateForGain(
-        Cc, Restart ? GAIN_UNIT : Bbr->PacingGain);
+    return QuicCongestionControlGetConnection(Cc)->Settings
+        .MaxPacingRateBytesPerSecond;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -323,8 +322,11 @@ BbrCongestionControlInitializeRateLimitBudget(
     QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
     const QUIC_CONNECTION* Connection =
         QuicCongestionControlGetConnection(Cc);
+    // Soft Max ceiling only: Max==0 means unlimited → no RateLimitBudget.
     const BOOLEAN RateLimitEnabled =
-        Connection->Settings.PacingEnabled && Rate != 0;
+        Connection->Settings.PacingEnabled &&
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0 &&
+        Rate != 0;
 
     if (!RateLimitEnabled) {
         BbrCongestionControlClearRateLimitBudget(Cc);
@@ -612,7 +614,8 @@ BbrCongestionControlOnDataSent(
 
     BOOLEAN PreviousCanSendState = BbrCongestionControlCanSend(Cc);
 
-    if (Connection->Settings.PacingEnabled) {
+    if (Connection->Settings.PacingEnabled &&
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0) {
         const uint64_t Rate = BbrCongestionControlGetRateLimitPacingRate(Cc);
         if (Rate == 0) {
             BbrCongestionControlClearRateLimitBudget(Cc);
@@ -808,14 +811,24 @@ BbrCongestionControlGetRateLimitBurstCapacity(
     _In_ uint64_t Rate
     )
 {
+    // Soft Max average-rate ceiling: allow ~1 RTT of Max traffic (floor 2ms)
+    // so high-BDP paths can still grow BytesInFlightMax / IdealBytes.
     const QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
+    const QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
     const uint32_t DatagramPayloadLength =
         QuicPathGetDatagramPayloadSize(&Connection->Paths[0]);
+    const uint64_t MinBurstWindowUs =
+        (uint64_t)QUIC_SEND_PACING_INTERVAL *
+            kRateLimitBudgetMaxPacingIntervals;
+    const uint64_t BurstWindowUs =
+        (Bbr->MinRttTimestampValid && Bbr->MinRtt > MinBurstWindowUs) ?
+            Bbr->MinRtt : MinBurstWindowUs;
+    const uint32_t BurstWindowUs32 =
+        (uint32_t)CXPLAT_MIN(BurstWindowUs, (uint64_t)UINT32_MAX);
     const uint64_t PacingQuantumBytes =
         BbrSaturatingMultiplyDivideCeil(
             Rate,
-            (uint64_t)QUIC_SEND_PACING_INTERVAL *
-                kRateLimitBudgetMaxPacingIntervals,
+            BurstWindowUs32,
             kMicroSecsInSec);
     const uint64_t BurstCapacity =
         CXPLAT_MAX((uint64_t)DatagramPayloadLength, PacingQuantumBytes);
@@ -907,33 +920,113 @@ BbrCongestionControlGetSendAllowance(
 {
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
     QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+    const uint64_t BandwidthEst = BbrCongestionControlGetBandwidth(Cc);
     const uint32_t CongestionWindow =
         BbrCongestionControlGetCongestionWindow(Cc);
-    if (!Connection->Settings.PacingEnabled) {
+    uint32_t SendAllowance = 0;
+    const BOOLEAN MaxRateLimitEnabled =
+        Connection->Settings.PacingEnabled &&
+        Connection->Settings.MaxPacingRateBytesPerSecond != 0;
+    const uint64_t MaxRate =
+        MaxRateLimitEnabled ?
+            BbrCongestionControlGetRateLimitPacingRate(Cc) : 0;
+
+    // RateLimitBudget is only the configured Max soft ceiling.
+    if (!MaxRateLimitEnabled || MaxRate == 0) {
         BbrCongestionControlClearRateLimitBudget(Cc);
+    } else {
+        //
+        // Refill BEFORE the CC-blocked early return. packet_builder advances
+        // Send.LastFlushTime on every prepare, including when allowance is 0.
+        // Skipping refill while Bif>=CWND permanently burns Max token time and
+        // leaves the soft ceiling chronically under-delivered.
+        //
+        if (!Bbr->RateLimitInitialized) {
+            BbrCongestionControlInitializeRateLimitBudget(Cc, MaxRate);
+        }
+        if (Bbr->RateLimitInitialized) {
+            BbrCongestionControlRefillRateLimitBudget(
+                Cc, MaxRate, TimeSinceLastSend, TimeSinceLastSendValid);
+        }
     }
+
     if (Bbr->BytesInFlight >= CongestionWindow) {
+        //
+        // We are CC blocked, so we can't send anything.
+        //
         return 0;
+
+    } else if (
+        !TimeSinceLastSendValid ||
+        !Connection->Settings.PacingEnabled ||
+        !Bbr->MinRttTimestampValid ||
+        Bbr->MinRtt < QUIC_SEND_PACING_INTERVAL) {
+        //
+        // We're not in the necessary state to pace.
+        //
+        SendAllowance = CongestionWindow - Bbr->BytesInFlight;
+
+    } else {
+        //
+        // Layer A: congestion pacing (upstream / pre-adaptive-budget style).
+        // BandwidthEst is in (bytes * BW_UNIT) / sec; matching microsoft/msquic
+        // and the historical high-throughput path, the time product is not
+        // divided by kMicroSecsInSec/BW_UNIT here — the CWND/4 cap below is
+        // what bounds each pacing chunk in practice.
+        //
+        uint64_t TimeAllowance;
+        if (Bbr->BbrState == BBR_STATE_STARTUP) {
+            const uint64_t StartupCwndAllowance =
+                (uint64_t)CongestionWindow * Bbr->PacingGain / GAIN_UNIT;
+            const uint64_t StartupBurst =
+                StartupCwndAllowance > Bbr->BytesInFlight ?
+                    StartupCwndAllowance - Bbr->BytesInFlight : 0;
+            TimeAllowance =
+                CXPLAT_MAX(
+                    BandwidthEst * Bbr->PacingGain * TimeSinceLastSend /
+                        GAIN_UNIT,
+                    StartupBurst);
+        } else {
+            TimeAllowance =
+                BandwidthEst * Bbr->PacingGain * TimeSinceLastSend /
+                    GAIN_UNIT;
+        }
+
+        if (TimeAllowance > CongestionWindow - Bbr->BytesInFlight) {
+            TimeAllowance = CongestionWindow - Bbr->BytesInFlight;
+        }
+
+        if (TimeAllowance > (CongestionWindow >> 2)) {
+            TimeAllowance = CongestionWindow >> 2; // Don't send more than a quarter of the current window.
+        }
+
+        //
+        // Layer B: soft Min floor — may raise above CWND/4, still <= CWND-Bif.
+        //
+        if (Connection->Settings.MinPacingRateBytesPerSecond != 0) {
+            const uint64_t MinPacingAllowance =
+                BbrSaturatingMultiplyDivide(
+                    Connection->Settings.MinPacingRateBytesPerSecond,
+                    (uint32_t)CXPLAT_MIN(
+                        TimeSinceLastSend,
+                        (uint64_t)UINT32_MAX),
+                    kMicroSecsInSec);
+            TimeAllowance = CXPLAT_MAX(TimeAllowance, MinPacingAllowance);
+            if (TimeAllowance > CongestionWindow - Bbr->BytesInFlight) {
+                TimeAllowance = CongestionWindow - Bbr->BytesInFlight;
+            }
+        }
+
+        SendAllowance =
+            (uint32_t)CXPLAT_MIN(TimeAllowance, (uint64_t)UINT32_MAX);
     }
 
-    const uint32_t CongestionAllowance =
-        CongestionWindow - Bbr->BytesInFlight;
-    if (!Connection->Settings.PacingEnabled) {
-        return CongestionAllowance;
+    //
+    // Layer C: soft Max ceiling via RateLimitBudget (already refilled above).
+    //
+    if (!MaxRateLimitEnabled || MaxRate == 0 || !Bbr->RateLimitInitialized) {
+        return SendAllowance;
     }
-
-    const uint64_t Rate = BbrCongestionControlGetRateLimitPacingRate(Cc);
-    if (Rate == 0) {
-        BbrCongestionControlClearRateLimitBudget(Cc);
-        return CongestionAllowance;
-    }
-
-    if (!Bbr->RateLimitInitialized) {
-        BbrCongestionControlInitializeRateLimitBudget(Cc, Rate);
-    }
-
-    BbrCongestionControlRefillRateLimitBudget(
-        Cc, Rate, TimeSinceLastSend, TimeSinceLastSendValid);
 
     const uint32_t DatagramPayloadLength =
         QuicPathGetDatagramPayloadSize(&Connection->Paths[0]);
@@ -942,7 +1035,7 @@ BbrCongestionControlGetSendAllowance(
     }
 
     return (uint32_t)CXPLAT_MIN(
-        (uint64_t)CongestionAllowance,
+        (uint64_t)SendAllowance,
         CXPLAT_MIN(Bbr->RateLimitBudgetBytes, (uint64_t)UINT32_MAX));
 }
 
