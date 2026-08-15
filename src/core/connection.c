@@ -1805,6 +1805,17 @@ QuicConnStart(
         return QUIC_STATUS_INVALID_STATE;
     }
 
+#ifdef QUIC_COMPARTMENT_ID
+    if (Connection->IceDatapathConfigured &&
+        Path->Binding != NULL &&
+        Path->Binding->CompartmentId != Configuration->CompartmentId) {
+        if (ServerName != NULL) {
+            CXPLAT_FREE(ServerName, QUIC_POOL_SERVERNAME);
+        }
+        return QUIC_STATUS_INVALID_STATE;
+    }
+#endif
+
     BOOLEAN RegistrationShutingDown;
     uint64_t ShutdownErrorCode;
     QUIC_CONNECTION_SHUTDOWN_FLAGS ShutdownFlags;

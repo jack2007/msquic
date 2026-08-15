@@ -1220,6 +1220,10 @@ SocketCreateUdp(
     )
 {
     QUIC_STATUS Status;
+    if ((Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT) &&
+        Config->RemoteAddress != NULL) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
     const BOOLEAN IsUnconnectedClient =
         !!(Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
     const BOOLEAN IsServerSocket =

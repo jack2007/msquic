@@ -1193,6 +1193,23 @@ TEST_P(DataPathTest, UdpUnconnectedClientSocket)
     EXPECT_TRUE(CxPlatEventWaitWithTimeout(RecvContext.ClientCompletion, 2000));
 }
 
+TEST_P(DataPathTest, UdpUnconnectedClientRejectsFixedRemote)
+{
+    UdpRecvContext RecvContext;
+    CxPlatDataPath Datapath(&UdpRecvCallbacks);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+
+    auto LocalAddress = GetNewUnspecAddr(false);
+    auto RemoteAddress = GetNewLocalAddr();
+    CxPlatSocket Client(
+        Datapath,
+        &LocalAddress.SockAddr,
+        &RemoteAddress.SockAddr,
+        &RecvContext,
+        CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+    EXPECT_EQ(QUIC_STATUS_INVALID_PARAMETER, Client.GetInitStatus());
+}
+
 TEST_P(DataPathTest, MultiBindListener) {
     UdpRecvContext RecvContext;
     CxPlatDataPath Datapath(&UdpRecvCallbacks);
