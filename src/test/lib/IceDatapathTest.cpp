@@ -46,7 +46,8 @@ struct IceCallbackContext {
         ZeroPortRemote,
         UnknownDisposition,
         ReinjectFullAlternateRemote,
-        ReinjectFirstThenPass
+        ReinjectFirstThenPass,
+        ConsumedFirstThenPass
     };
     std::atomic<RxAction> Action {RxAction::Pass};
     std::atomic<uint32_t> ReceiveCount {0};
@@ -207,6 +208,10 @@ IceReceive(
             CallbackContext->LastInnerRemoteAddress = Output->InnerRemoteAddress;
         }
         return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::ConsumedFirstThenPass:
+        Output->Disposition =
+            ReceiveIndex == 0 ? QUIC_ICE_RX_CONSUMED : QUIC_ICE_RX_PASS;
+        return Output->Disposition;
     }
 
     return QUIC_ICE_RX_PASS;
@@ -1055,6 +1060,66 @@ TEST(IceDatapath, ReceiveDemuxPassConsumedAndReinject)
     }
     EXPECT_EQ(3u, Context.ReceiveCount.load(std::memory_order_relaxed));
     Listener.Close();
+}
+
+TEST(IceDatapath, ConsumedCompletesWithoutQuicPreprocess)
+{
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    MsQuicAlpn Alpn("IceConsumedBarrier");
+    QuicAddr LocalAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    LocalAddress.SetPort(0);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.Start(Alpn, &LocalAddress.SockAddr));
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.GetLocalAddr(LocalAddress));
+    const uint64_t InitialDroppedPackets = GetListenerDroppedPackets(Listener);
+
+    // Both segments arrive in one UDP_GRO receive chain. QuicBindingReceive
+    // cannot invoke the second callback until it has applied the first
+    // callback's CONSUMED disposition, which is the production completion
+    // barrier needed for the final exact dropped-packet assertion.
+    const std::array<uint8_t, 40> Segments = {
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x02,
+        0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00};
+    Context.Action.store(
+        IceCallbackContext::RxAction::ConsumedFirstThenPass,
+        std::memory_order_release);
+    QUIC_ADDR SenderAddress = {};
+    if (!SendIceSegmentedDatagrams(
+            LocalAddress.SockAddr,
+            Segments.data(),
+            Segments.size(),
+            20,
+            SenderAddress)) {
+        Listener.Close();
+        GTEST_SKIP() << "UDP segmentation is unavailable";
+    }
+
+    ASSERT_TRUE(WaitForReceiveCount(Context, 2));
+    EXPECT_TRUE(WaitForListenerDroppedPackets(
+        Listener, InitialDroppedPackets + 1));
+    EXPECT_EQ(2u, Context.ReceiveCount.load(std::memory_order_acquire));
+    Listener.Close();
+#else
+    GTEST_SKIP() << "UDP segmentation is unavailable";
+#endif
 }
 
 TEST(IceDatapath, ReinjectDoesNotPolluteSharedGroRoute)

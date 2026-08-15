@@ -580,8 +580,10 @@ QuicBindingCommitIceExtension(
     CXPLAT_DBG_ASSERT(Binding->IceExtension.Installing);
     CXPLAT_DBG_ASSERT(!Binding->IceExtension.Bound);
     Binding->IceExtension.Installing = FALSE;
-    CXPLAT_DBG_ASSERT(!InterlockedCompareExchange(
-        &Binding->IceExtension.Bound, TRUE, FALSE));
+    const long PreviousBound = InterlockedCompareExchange(
+        &Binding->IceExtension.Bound, TRUE, FALSE);
+    CXPLAT_DBG_ASSERT(PreviousBound == FALSE);
+    UNREFERENCED_PARAMETER(PreviousBound);
     CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
 
     // This may synchronously uninitialize the binding. It must be the final
