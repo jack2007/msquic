@@ -568,6 +568,12 @@ QuicBindingSend(
     _In_ uint32_t DatagramsToSend
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicBindingIceSelectedPathIsReady(
+    _In_ QUIC_BINDING* Binding
+    );
+
 
 //
 // Indicates Dos mode state change for each listener

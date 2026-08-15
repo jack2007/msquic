@@ -1899,6 +1899,127 @@ CxPlatSendDataIsFull(
     return !CxPlatSendDataCanAllocSend(SendData, SendData->SegmentSize);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSendDataEnumerateDatagrams(
+    _In_ CXPLAT_SEND_DATA* SendData,
+    _In_ uint32_t ExpectedDatagrams,
+    _In_ uint32_t ExpectedBytes,
+    _In_ CXPLAT_SEND_DATAGRAM_CALLBACK Callback,
+    _In_ void* Context
+    )
+{
+    if (SendData == NULL || Callback == NULL || Context == NULL ||
+        ExpectedDatagrams == 0 || ExpectedBytes == 0) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    CxPlatSendDataFinalizeSendBuffer(SendData);
+
+    uint64_t DatagramCount = 0;
+    uint64_t ByteCount = 0;
+    for (uint32_t i = 0; i < SendData->BufferCount; ++i) {
+        const QUIC_BUFFER* Buffer = &SendData->Buffers[i];
+        if (Buffer->Buffer == NULL || Buffer->Length == 0) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+        ByteCount += Buffer->Length;
+        if (SendData->SegmentSize != 0) {
+            DatagramCount +=
+                ((uint64_t)Buffer->Length + SendData->SegmentSize - 1) /
+                    SendData->SegmentSize;
+        } else {
+            if (Buffer->Length > UINT16_MAX) {
+                return QUIC_STATUS_INVALID_PARAMETER;
+            }
+            ++DatagramCount;
+        }
+    }
+    if (DatagramCount != ExpectedDatagrams ||
+        ByteCount != ExpectedBytes ||
+        DatagramCount == 0 || ByteCount == 0) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    for (uint32_t i = 0; i < SendData->BufferCount; ++i) {
+        const uint8_t* Buffer = SendData->Buffers[i].Buffer;
+        uint32_t Remaining = SendData->Buffers[i].Length;
+        if (SendData->SegmentSize == 0) {
+            QUIC_STATUS Status =
+                Callback(Context, Buffer, (uint16_t)Remaining);
+            if (QUIC_FAILED(Status)) {
+                return Status;
+            }
+            continue;
+        }
+        while (Remaining != 0) {
+            const uint16_t Length =
+                (uint16_t)(Remaining > SendData->SegmentSize ?
+                    SendData->SegmentSize : Remaining);
+            QUIC_STATUS Status = Callback(Context, Buffer, Length);
+            if (QUIC_FAILED(Status)) {
+                return Status;
+            }
+            Buffer += Length;
+            Remaining -= Length;
+        }
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketGetRouteForPartition(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _Out_ CXPLAT_ROUTE* Route
+    )
+{
+    if (Socket == NULL || RemoteAddress == NULL || Route == NULL) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    const uint32_t SocketCount =
+        Socket->NumPerProcessorSockets ? Socket->Datapath->PartitionCount : 1;
+    for (uint32_t i = 0; i < SocketCount; ++i) {
+        CXPLAT_SOCKET_CONTEXT* SocketContext = &Socket->SocketContexts[i];
+        if (SocketContext->DatapathPartition->PartitionIndex !=
+                PartitionIndex) {
+            continue;
+        }
+        CxPlatZeroMemory(Route, sizeof(*Route));
+        Route->Queue = (CXPLAT_QUEUE*)SocketContext;
+        Route->RemoteAddress = *RemoteAddress;
+        Route->LocalAddress = Socket->LocalAddress;
+        if (QuicAddrIsWildCard(&Route->LocalAddress) &&
+            QuicAddrGetFamily(&Route->LocalAddress) !=
+                QuicAddrGetFamily(RemoteAddress)) {
+            QuicAddrSetFamily(
+                &Route->LocalAddress,
+                QuicAddrGetFamily(RemoteAddress));
+        }
+        Route->DatapathType = CXPLAT_DATAPATH_TYPE_NORMAL;
+        Route->State = RouteResolved;
+        return QUIC_STATUS_SUCCESS;
+    }
+    return QUIC_STATUS_NOT_SUPPORTED;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketSetLocalMtuCap(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t Mtu
+    )
+{
+    if (Socket == NULL || Mtu < 1280 || Mtu > CXPLAT_MAX_MTU) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    if (Socket->Mtu > Mtu) {
+        Socket->Mtu = Mtu;
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
 void
 CxPlatSendDataComplete(
     _In_ CXPLAT_SOCKET_CONTEXT* SocketContext,

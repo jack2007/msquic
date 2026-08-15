@@ -36,6 +36,31 @@ CxPlatSocketGetTestPeerNameError(
     );
 }
 
+struct DatagramEnumerationContext {
+    uint32_t Count {0};
+    uint32_t Bytes {0};
+    uint32_t FailAt {UINT32_MAX};
+    std::vector<std::vector<uint8_t>> Datagrams;
+};
+
+QUIC_STATUS
+QUIC_API
+RecordEnumeratedDatagram(
+    void* Context,
+    const uint8_t* Buffer,
+    uint16_t BufferLength)
+{
+    auto* Enumeration =
+        static_cast<DatagramEnumerationContext*>(Context);
+    if (Enumeration->Count == Enumeration->FailAt) {
+        return QUIC_STATUS_ABORTED;
+    }
+    Enumeration->Count++;
+    Enumeration->Bytes += BufferLength;
+    Enumeration->Datagrams.emplace_back(Buffer, Buffer + BufferLength);
+    return QUIC_STATUS_SUCCESS;
+}
+
 //
 // Connect to the duonic address (if using duonic) or localhost (if not).
 //
@@ -738,6 +763,143 @@ TEST_F(DataPathTest, Initialize)
         ASSERT_NE(nullptr, Datapath.Datapath);
         ASSERT_TRUE(Datapath.IsSupported(CXPLAT_DATAPATH_FEATURE_RAW, CXPLAT_SOCKET_FLAG_XDP));
     }
+}
+
+TEST_P(DataPathTest, EnumerateSendDatagramsValidatesBeforeCallback)
+{
+    CxPlatDataPath Datapath(&EmptyUdpCallbacks);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+
+    auto RemoteAddress = GetNewLocalAddr();
+    RemoteAddress.SetPort(GetNextPort());
+    CxPlatSocket Socket(Datapath, nullptr, &RemoteAddress.SockAddr, nullptr);
+    VERIFY_QUIC_SUCCESS(Socket.GetInitStatus());
+
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &Socket.Route, 4, CXPLAT_ECN_NON_ECT, 0, CXPLAT_DSCP_CS0};
+    CXPLAT_SEND_DATA* SendData = CxPlatSendDataAlloc(Socket, &SendConfig);
+    ASSERT_NE(nullptr, SendData);
+    const std::array<std::array<uint8_t, 4>, 2> Full = {{
+        {{0, 1, 2, 3}}, {{4, 5, 6, 7}}}};
+    for (const auto& Bytes : Full) {
+        QUIC_BUFFER* Buffer =
+            CxPlatSendDataAllocBuffer(SendData, (uint16_t)Bytes.size());
+        ASSERT_NE(nullptr, Buffer);
+        CxPlatCopyMemory(Buffer->Buffer, Bytes.data(), Bytes.size());
+    }
+    const std::array<uint8_t, 2> Short = {{8, 9}};
+    QUIC_BUFFER* Buffer =
+        CxPlatSendDataAllocBuffer(SendData, (uint16_t)Short.size());
+    ASSERT_NE(nullptr, Buffer);
+    CxPlatCopyMemory(Buffer->Buffer, Short.data(), Short.size());
+
+    DatagramEnumerationContext MismatchedCount;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 2, 10, RecordEnumeratedDatagram, &MismatchedCount));
+    EXPECT_EQ(0u, MismatchedCount.Count);
+
+    DatagramEnumerationContext MismatchedBytes;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 3, 9, RecordEnumeratedDatagram, &MismatchedBytes));
+    EXPECT_EQ(0u, MismatchedBytes.Count);
+
+    DatagramEnumerationContext Enumeration;
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 3, 10, RecordEnumeratedDatagram, &Enumeration));
+    ASSERT_EQ(3u, Enumeration.Count);
+    EXPECT_EQ(10u, Enumeration.Bytes);
+    ASSERT_EQ(3u, Enumeration.Datagrams.size());
+    EXPECT_EQ(std::vector<uint8_t>(Full[0].begin(), Full[0].end()), Enumeration.Datagrams[0]);
+    EXPECT_EQ(std::vector<uint8_t>(Full[1].begin(), Full[1].end()), Enumeration.Datagrams[1]);
+    EXPECT_EQ(std::vector<uint8_t>(Short.begin(), Short.end()), Enumeration.Datagrams[2]);
+
+    CxPlatSendDataFree(SendData);
+}
+
+TEST_P(DataPathTest, EnumerateSendDatagramsStopsAtFirstCallbackError)
+{
+    CxPlatDataPath Datapath(&EmptyUdpCallbacks);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+
+    auto RemoteAddress = GetNewLocalAddr();
+    RemoteAddress.SetPort(GetNextPort());
+    CxPlatSocket Socket(Datapath, nullptr, &RemoteAddress.SockAddr, nullptr);
+    VERIFY_QUIC_SUCCESS(Socket.GetInitStatus());
+
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &Socket.Route, 4, CXPLAT_ECN_NON_ECT, 0, CXPLAT_DSCP_CS0};
+    CXPLAT_SEND_DATA* SendData = CxPlatSendDataAlloc(Socket, &SendConfig);
+    ASSERT_NE(nullptr, SendData);
+    for (uint8_t Value = 0; Value < 3; ++Value) {
+        QUIC_BUFFER* Buffer = CxPlatSendDataAllocBuffer(SendData, 4);
+        ASSERT_NE(nullptr, Buffer);
+        memset(Buffer->Buffer, Value, 4);
+    }
+
+    DatagramEnumerationContext Enumeration;
+    Enumeration.FailAt = 1;
+    EXPECT_EQ(
+        QUIC_STATUS_ABORTED,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 3, 12, RecordEnumeratedDatagram, &Enumeration));
+    EXPECT_EQ(1u, Enumeration.Count);
+    EXPECT_EQ(4u, Enumeration.Bytes);
+    CxPlatSendDataFree(SendData);
+}
+
+TEST_P(DataPathTest, EnumerateSendDatagramsRejectsEmptyBeforeCallback)
+{
+    CxPlatDataPath Datapath(&EmptyUdpCallbacks);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+
+    auto RemoteAddress = GetNewLocalAddr();
+    RemoteAddress.SetPort(GetNextPort());
+    CxPlatSocket Socket(Datapath, nullptr, &RemoteAddress.SockAddr, nullptr);
+    VERIFY_QUIC_SUCCESS(Socket.GetInitStatus());
+
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &Socket.Route, 4, CXPLAT_ECN_NON_ECT, 0, CXPLAT_DSCP_CS0};
+    CXPLAT_SEND_DATA* SendData = CxPlatSendDataAlloc(Socket, &SendConfig);
+    ASSERT_NE(nullptr, SendData);
+    DatagramEnumerationContext Enumeration;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 0, 0, RecordEnumeratedDatagram, &Enumeration));
+    EXPECT_EQ(0u, Enumeration.Count);
+    CxPlatSendDataFree(SendData);
+}
+
+TEST_P(DataPathTest, LocalMtuCapOnlyLowersSocketMtu)
+{
+    CxPlatDataPath Datapath(&EmptyUdpCallbacks);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+
+    auto RemoteAddress = GetNewLocalAddr();
+    RemoteAddress.SetPort(GetNextPort());
+    CxPlatSocket Socket(Datapath, nullptr, &RemoteAddress.SockAddr, nullptr);
+    VERIFY_QUIC_SUCCESS(Socket.GetInitStatus());
+
+    const uint16_t InitialMtu =
+        CxPlatSocketGetLocalMtu(Socket.Socket, &Socket.Route);
+    ASSERT_GE(InitialMtu, 1400u);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSocketSetLocalMtuCap(Socket.Socket, 1279));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        CxPlatSocketSetLocalMtuCap(Socket.Socket, 1400));
+    EXPECT_EQ(1400u, CxPlatSocketGetLocalMtu(Socket.Socket, &Socket.Route));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        CxPlatSocketSetLocalMtuCap(Socket.Socket, InitialMtu));
+    EXPECT_EQ(1400u, CxPlatSocketGetLocalMtu(Socket.Socket, &Socket.Route));
 }
 
 TEST_F(DataPathTest, InitializeInvalid)

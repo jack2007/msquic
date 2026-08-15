@@ -3873,6 +3873,107 @@ SendDataIsFull(
     return !CxPlatSendDataCanAllocSend(SendData, SendData->SegmentSize);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+SendDataEnumerateDatagrams(
+    _In_ CXPLAT_SEND_DATA* SendData,
+    _In_ uint32_t ExpectedDatagrams,
+    _In_ uint32_t ExpectedBytes,
+    _In_ CXPLAT_SEND_DATAGRAM_CALLBACK Callback,
+    _In_ void* Context
+    )
+{
+    CxPlatSendDataFinalizeSendBuffer(SendData);
+
+    uint64_t DatagramCount = 0;
+    uint64_t ByteCount = 0;
+    for (uint8_t i = 0; i < SendData->WsaBufferCount; ++i) {
+        const WSABUF* Buffer = &SendData->WsaBuffers[i];
+        if (Buffer->buf == NULL || Buffer->len == 0) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+        ByteCount += Buffer->len;
+        if (SendData->SegmentSize != 0) {
+            DatagramCount +=
+                ((uint64_t)Buffer->len + SendData->SegmentSize - 1) /
+                    SendData->SegmentSize;
+        } else {
+            if (Buffer->len > UINT16_MAX) {
+                return QUIC_STATUS_INVALID_PARAMETER;
+            }
+            ++DatagramCount;
+        }
+    }
+    if (DatagramCount != ExpectedDatagrams ||
+        ByteCount != ExpectedBytes ||
+        DatagramCount == 0 || ByteCount == 0) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    for (uint8_t i = 0; i < SendData->WsaBufferCount; ++i) {
+        const uint8_t* Buffer =
+            (const uint8_t*)SendData->WsaBuffers[i].buf;
+        size_t Remaining = SendData->WsaBuffers[i].len;
+        if (SendData->SegmentSize == 0) {
+            QUIC_STATUS Status =
+                Callback(Context, Buffer, (uint16_t)Remaining);
+            if (QUIC_FAILED(Status)) {
+                return Status;
+            }
+            continue;
+        }
+        while (Remaining != 0) {
+            const uint16_t Length =
+                (uint16_t)(Remaining > SendData->SegmentSize ?
+                    SendData->SegmentSize : Remaining);
+            QUIC_STATUS Status = Callback(Context, Buffer, Length);
+            if (QUIC_FAILED(Status)) {
+                return Status;
+            }
+            Buffer += Length;
+            Remaining -= Length;
+        }
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+SocketGetRouteForPartition(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _Out_ CXPLAT_ROUTE* Route
+    )
+{
+    if (CxPlatDpRawIsRawDatapathOnly(Socket->Datapath->RawDataPath)) {
+        return QUIC_STATUS_NOT_SUPPORTED;
+    }
+    const uint16_t SocketCount =
+        Socket->NumPerProcessorSockets ? (uint16_t)CxPlatProcCount() : 1;
+    for (uint16_t i = 0; i < SocketCount; ++i) {
+        CXPLAT_SOCKET_PROC* SocketProc = &Socket->PerProcSockets[i];
+        if (SocketProc->DatapathProc->PartitionIndex != PartitionIndex) {
+            continue;
+        }
+        CxPlatZeroMemory(Route, sizeof(*Route));
+        Route->Queue = (CXPLAT_QUEUE*)SocketProc;
+        Route->RemoteAddress = *RemoteAddress;
+        Route->LocalAddress = Socket->LocalAddress;
+        if (QuicAddrIsWildCard(&Route->LocalAddress) &&
+            QuicAddrGetFamily(&Route->LocalAddress) !=
+                QuicAddrGetFamily(RemoteAddress)) {
+            QuicAddrSetFamily(
+                &Route->LocalAddress,
+                QuicAddrGetFamily(RemoteAddress));
+        }
+        Route->DatapathType = CXPLAT_DATAPATH_TYPE_NORMAL;
+        Route->State = RouteResolved;
+        return QUIC_STATUS_SUCCESS;
+    }
+    return QUIC_STATUS_NOT_SUPPORTED;
+}
+
 void
 CxPlatSendDataComplete(
     _In_ CXPLAT_SEND_DATA* SendData,

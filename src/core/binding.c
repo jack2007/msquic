@@ -29,6 +29,9 @@ Abstract:
     sizeof(uint32_t) + \
     (ARRAYSIZE(QuicSupportedVersionList) * sizeof(uint32_t)) \
 )
+
+#define QUIC_ICE_PATH_INSTALLING ((long)3)
+#define QUIC_ICE_RELAY_MTU_CAP 1400
 CXPLAT_STATIC_ASSERT(
     QUIC_DPLPMTUD_MIN_MTU - 48 >= MAX_VER_NEG_PACKET_LENGTH,
     "Too many supported version numbers! Requires too big of buffer for response!");
@@ -396,6 +399,24 @@ QuicBindingPrepareIceExtensionLocked(
     return QUIC_STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicBindingIceSelectedPathIsReady(
+    _In_ QUIC_BINDING* Binding
+    )
+{
+    if (Binding == NULL ||
+        !QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Bound) ||
+        QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing)) {
+        return FALSE;
+    }
+    const long PathType =
+        QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.PathType);
+    return
+        PathType == QUIC_ICE_PATH_DIRECT ||
+        PathType == QUIC_ICE_PATH_RELAY;
+}
+
 static
 QUIC_STATUS
 QUIC_API
@@ -407,9 +428,18 @@ QuicBindingIceSendControl(
     _In_ uint32_t BufferLength
     )
 {
-    UNREFERENCED_PARAMETER(PartitionIndex);
     if (BindingContext == NULL || RemoteAddress == NULL ||
-        Buffer == NULL || BufferLength == 0) {
+        Buffer == NULL || BufferLength == 0 ||
+        BufferLength > MAX_UDP_PAYLOAD_LENGTH) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    const QUIC_ADDRESS_FAMILY Family = QuicAddrGetFamily(RemoteAddress);
+    if ((Family != QUIC_ADDRESS_FAMILY_INET &&
+            Family != QUIC_ADDRESS_FAMILY_INET6) ||
+        !QuicAddrIsValid(RemoteAddress) ||
+        QuicAddrIsWildCard(RemoteAddress) ||
+        QuicAddrGetPort(RemoteAddress) == 0) {
         return QUIC_STATUS_INVALID_PARAMETER;
     }
 
@@ -418,13 +448,56 @@ QuicBindingIceSendControl(
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    QUIC_STATUS Status =
-        QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing) ||
-        !Binding->IceExtension.Configured ?
-            QUIC_STATUS_INVALID_STATE : QUIC_STATUS_NOT_SUPPORTED;
+    QUIC_STATUS Status = QUIC_STATUS_INVALID_STATE;
+    if (QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing) ||
+        !Binding->IceExtension.Configured) {
+        goto Exit;
+    }
 
-    // Task 5 replaces this fail-closed stub with the internal-bypass CxPlat
-    // send path. Exposing the versioned function slot now keeps the ABI stable.
+#if defined(_KERNEL_MODE)
+    Status = QUIC_STATUS_NOT_SUPPORTED;
+#else
+    if (CxPlatSocketRawSocketAvailable(Binding->Socket)) {
+        Status = QUIC_STATUS_NOT_SUPPORTED;
+        goto Exit;
+    }
+
+    CXPLAT_ROUTE Route;
+    Status =
+        CxPlatSocketGetRouteForPartition(
+            Binding->Socket,
+            PartitionIndex,
+            RemoteAddress,
+            &Route);
+    if (QUIC_FAILED(Status)) {
+        goto Exit;
+    }
+
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &Route,
+        0,
+        CXPLAT_ECN_NON_ECT,
+        CXPLAT_SEND_FLAGS_NONE,
+        CXPLAT_DSCP_CS0};
+    CXPLAT_SEND_DATA* SendData =
+        CxPlatSendDataAlloc(Binding->Socket, &SendConfig);
+    if (SendData == NULL) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        goto Exit;
+    }
+    QUIC_BUFFER* SendBuffer =
+        CxPlatSendDataAllocBuffer(SendData, (uint16_t)BufferLength);
+    if (SendBuffer == NULL) {
+        CxPlatSendDataFree(SendData);
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        goto Exit;
+    }
+    CxPlatCopyMemory(SendBuffer->Buffer, Buffer, BufferLength);
+    CxPlatSocketSend(Binding->Socket, &Route, SendData);
+    Status = QUIC_STATUS_SUCCESS;
+#endif
+
+Exit:
     CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
     return Status;
 }
@@ -453,13 +526,52 @@ QuicBindingIceSetSelectedPath(
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    long PreviousPathType;
-    do {
-        PreviousPathType = Binding->IceExtension.PathType;
-    } while (InterlockedCompareExchange(
-                 &Binding->IceExtension.PathType,
-                 (long)PathType,
-                 PreviousPathType) != PreviousPathType);
+    if (PathType == QUIC_ICE_PATH_RELAY &&
+        (!Binding->Exclusive || Binding->ServerOwned)) {
+        CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+        return QUIC_STATUS_NOT_SUPPORTED;
+    }
+
+#if defined(_KERNEL_MODE)
+    CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+    return QUIC_STATUS_NOT_SUPPORTED;
+#else
+    if (CxPlatSocketRawSocketAvailable(Binding->Socket)) {
+        CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+        return QUIC_STATUS_NOT_SUPPORTED;
+    }
+
+    if (InterlockedCompareExchange(
+            &Binding->IceExtension.PathType,
+            QUIC_ICE_PATH_INSTALLING,
+            QUIC_ICE_PATH_UNSELECTED) != QUIC_ICE_PATH_UNSELECTED) {
+        CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    if (PathType == QUIC_ICE_PATH_RELAY) {
+        const QUIC_STATUS Status =
+            CxPlatSocketSetLocalMtuCap(
+                Binding->Socket, QUIC_ICE_RELAY_MTU_CAP);
+        if (QUIC_FAILED(Status)) {
+            const long PreviousPath =
+                InterlockedCompareExchange(
+                    &Binding->IceExtension.PathType,
+                    QUIC_ICE_PATH_UNSELECTED,
+                    QUIC_ICE_PATH_INSTALLING);
+            CXPLAT_FRE_ASSERT(
+                PreviousPath == QUIC_ICE_PATH_INSTALLING);
+            CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+            return Status;
+        }
+    }
+    const long PreviousPath =
+        InterlockedCompareExchange(
+            &Binding->IceExtension.PathType,
+            (long)PathType,
+            QUIC_ICE_PATH_INSTALLING);
+    CXPLAT_FRE_ASSERT(PreviousPath == QUIC_ICE_PATH_INSTALLING);
+#endif
     CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
     return QUIC_STATUS_SUCCESS;
 }
@@ -2327,6 +2439,29 @@ QuicBindingUnreachable(
     }
 }
 
+typedef struct QUIC_ICE_RELAY_SEND_CONTEXT {
+    QUIC_ICE_EXTENSION* Extension;
+} QUIC_ICE_RELAY_SEND_CONTEXT;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIceSendRelayDatagram(
+    _In_ void* Context,
+    _In_reads_bytes_(BufferLength) const uint8_t* Buffer,
+    _In_ uint16_t BufferLength
+    )
+{
+    QUIC_ICE_RELAY_SEND_CONTEXT* SendContext =
+        (QUIC_ICE_RELAY_SEND_CONTEXT*)Context;
+    return
+        SendContext->Extension->Config.SendRelayDatagram(
+            SendContext->Extension->Config.Context,
+            Buffer,
+            BufferLength);
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
 QuicBindingSend(
@@ -2338,6 +2473,81 @@ QuicBindingSend(
     _In_ uint32_t DatagramsToSend
     )
 {
+    if (QuicBindingIceBoundIsPublished(&Binding->IceExtension.Bound)) {
+#if defined(_KERNEL_MODE)
+        // Kernel ICE TX is not part of private v1. SetSelectedPath rejects it,
+        // and this remains the defensive fail-closed gate.
+        InterlockedIncrement64(
+            (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+        CxPlatSendDataFree(SendData);
+        goto Complete;
+#else
+        const long PathType =
+            QuicBindingIceAtomicLoadAcquire(
+                &Binding->IceExtension.PathType);
+
+        // A configured ICE binding never permits a raw/XDP send. Selection
+        // normally rejects raw availability before this point; Route is the
+        // final defensive gate for an already-created SendData.
+        if (Route->DatapathType != CXPLAT_DATAPATH_TYPE_NORMAL) {
+            InterlockedIncrement64(
+                (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+            CxPlatSendDataFree(SendData);
+            goto Complete;
+        }
+
+        if (PathType == QUIC_ICE_PATH_DIRECT) {
+            goto NativeSend;
+        }
+
+        if (PathType == QUIC_ICE_PATH_RELAY) {
+            if (!Binding->Exclusive || Binding->ServerOwned ||
+                !CxPlatRundownAcquire(
+                    &Binding->IceExtension.UpcallRundown)) {
+                InterlockedIncrement64(
+                    (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                CxPlatSendDataFree(SendData);
+                goto Complete;
+            }
+
+            QUIC_STATUS Status = QUIC_STATUS_INVALID_STATE;
+            if (QuicBindingIceBoundIsPublished(
+                    &Binding->IceExtension.Bound) &&
+                !QuicBindingIceAtomicLoadAcquire(
+                    &Binding->IceExtension.Closing) &&
+                QuicBindingIceAtomicLoadAcquire(
+                    &Binding->IceExtension.PathType) ==
+                    QUIC_ICE_PATH_RELAY &&
+                Binding->Exclusive && !Binding->ServerOwned) {
+                QUIC_ICE_RELAY_SEND_CONTEXT SendContext = {
+                    &Binding->IceExtension};
+                Status =
+                    CxPlatSendDataEnumerateDatagrams(
+                        SendData,
+                        DatagramsToSend,
+                        BytesToSend,
+                        QuicBindingIceSendRelayDatagram,
+                        &SendContext);
+            }
+            CxPlatRundownRelease(
+                &Binding->IceExtension.UpcallRundown);
+            CxPlatSendDataFree(SendData);
+            if (QUIC_FAILED(Status)) {
+                InterlockedIncrement64(
+                    (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+            }
+            goto Complete;
+        }
+
+        // UNSELECTED, INSTALLING and unknown states cannot send QUIC payload.
+        InterlockedIncrement64(
+            (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+        CxPlatSendDataFree(SendData);
+        goto Complete;
+#endif
+    }
+
+NativeSend:
 #if QUIC_TEST_DATAPATH_HOOKS_ENABLED
     QUIC_TEST_DATAPATH_HOOKS* Hooks = MsQuicLib.TestDatapathHooks;
     if (Hooks != NULL) {
@@ -2366,6 +2576,7 @@ QuicBindingSend(
     }
 #endif
 
+Complete:
     QuicPerfCounterAdd(Partition, QUIC_PERF_COUNTER_UDP_SEND, DatagramsToSend);
     QuicPerfCounterAdd(Partition, QUIC_PERF_COUNTER_UDP_SEND_BYTES, BytesToSend);
     QuicPerfCounterIncrement(Partition, QUIC_PERF_COUNTER_UDP_SEND_CALLS);

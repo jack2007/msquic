@@ -30,6 +30,26 @@ struct IceCallbackContext {
     CxPlatEvent AllowBoundReturn;
     QUIC_ICE_BINDING_API_V1 Binding {};
     QUIC_ADDR LocalAddress {};
+    std::atomic<uint32_t> RelayCount {0};
+    std::atomic<uint32_t> RelayBytes {0};
+    std::atomic<uint32_t> RelayMaxLength {0};
+    CxPlatEvent RelayEvent;
+    CxPlatEvent RelayEntered;
+    CxPlatEvent AllowRelayReturn;
+    std::atomic<bool> BlockRelay {false};
+    std::atomic<bool> ReenterControlFromRelay {false};
+    QUIC_ADDR ControlRemoteAddress {};
+    std::atomic<uint16_t> ControlPartitionIndex {UINT16_MAX};
+    std::array<uint8_t, 8> ControlBytes {{
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42}};
+    std::atomic<QUIC_STATUS> RelayControlStatus {QUIC_STATUS_ABORTED};
+    bool SelectPathOnBound {false};
+    QUIC_ICE_PATH_TYPE BoundPath {QUIC_ICE_PATH_DIRECT};
+    std::atomic<QUIC_STATUS> BoundPathStatus {QUIC_STATUS_ABORTED};
+    bool SendControlOnBound {false};
+    std::atomic<QUIC_STATUS> BoundControlStatus {QUIC_STATUS_ABORTED};
+    bool SendControlOnUnbound {false};
+    std::atomic<QUIC_STATUS> UnboundControlStatus {QUIC_STATUS_ABORTED};
     HQUIC StopListenerOnBound {nullptr};
     bool BlockBound {false};
     enum class RxAction {
@@ -231,10 +251,39 @@ IceReceive(
 QUIC_STATUS
 QUIC_API
 IceSendRelayDatagram(
-    void*,
+    void* Context,
     const uint8_t*,
-    uint32_t)
+    uint32_t BufferLength)
 {
+    auto* CallbackContext = static_cast<IceCallbackContext*>(Context);
+    CallbackContext->RelayCount.fetch_add(1, std::memory_order_relaxed);
+    CallbackContext->RelayBytes.fetch_add(BufferLength, std::memory_order_relaxed);
+    uint32_t PreviousMax =
+        CallbackContext->RelayMaxLength.load(std::memory_order_relaxed);
+    while (PreviousMax < BufferLength &&
+           !CallbackContext->RelayMaxLength.compare_exchange_weak(
+               PreviousMax,
+               BufferLength,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    CallbackContext->RelayEntered.Set();
+    if (CallbackContext->ReenterControlFromRelay.exchange(
+            false, std::memory_order_acq_rel)) {
+        CallbackContext->RelayControlStatus.store(
+            CallbackContext->Binding.SendControl(
+                CallbackContext->Binding.BindingContext,
+                CallbackContext->ControlPartitionIndex.load(
+                    std::memory_order_acquire),
+                &CallbackContext->ControlRemoteAddress,
+                CallbackContext->ControlBytes.data(),
+                (uint32_t)CallbackContext->ControlBytes.size()),
+            std::memory_order_release);
+    }
+    if (CallbackContext->BlockRelay.load(std::memory_order_acquire)) {
+        CallbackContext->AllowRelayReturn.WaitForever();
+    }
+    CallbackContext->RelayEvent.Set();
     return QUIC_STATUS_SUCCESS;
 }
 
@@ -249,6 +298,33 @@ IceBound(
     CallbackContext->Binding = *Binding;
     CallbackContext->LocalAddress = *LocalAddress;
     CallbackContext->BoundCount.fetch_add(1, std::memory_order_relaxed);
+    if (CallbackContext->SelectPathOnBound) {
+        CallbackContext->BoundPathStatus.store(
+            Binding->SetSelectedPath(
+                Binding->BindingContext, CallbackContext->BoundPath),
+            std::memory_order_release);
+    }
+    if (CallbackContext->SendControlOnBound) {
+        QUIC_STATUS Status = QUIC_STATUS_NOT_SUPPORTED;
+        for (uint16_t Partition = 0;
+             Partition < (uint16_t)CxPlatProcCount();
+             ++Partition) {
+            Status =
+                Binding->SendControl(
+                    Binding->BindingContext,
+                    Partition,
+                    &CallbackContext->ControlRemoteAddress,
+                    CallbackContext->ControlBytes.data(),
+                    (uint32_t)CallbackContext->ControlBytes.size());
+            if (QUIC_SUCCEEDED(Status)) {
+                CallbackContext->ControlPartitionIndex.store(
+                    Partition, std::memory_order_release);
+                break;
+            }
+        }
+        CallbackContext->BoundControlStatus.store(
+            Status, std::memory_order_release);
+    }
     CallbackContext->BoundEvent.Set();
     CallbackContext->BoundEntered.Set();
     if (CallbackContext->StopListenerOnBound != nullptr) {
@@ -264,6 +340,17 @@ QUIC_API
 IceUnbound(void* Context)
 {
     auto* CallbackContext = static_cast<IceCallbackContext*>(Context);
+    if (CallbackContext->SendControlOnUnbound) {
+        CallbackContext->UnboundControlStatus.store(
+            CallbackContext->Binding.SendControl(
+                CallbackContext->Binding.BindingContext,
+                CallbackContext->ControlPartitionIndex.load(
+                    std::memory_order_acquire),
+                &CallbackContext->ControlRemoteAddress,
+                CallbackContext->ControlBytes.data(),
+                (uint32_t)CallbackContext->ControlBytes.size()),
+            std::memory_order_release);
+    }
     CallbackContext->UnboundCount.fetch_add(1, std::memory_order_relaxed);
     CallbackContext->UnboundEvent.Set();
 }
@@ -407,6 +494,142 @@ SendIceDatagram(
 #else
     close(Socket);
 #endif
+}
+
+class IceNativeUdpReceiver {
+public:
+#ifdef _WIN32
+    SOCKET Socket {INVALID_SOCKET};
+#else
+    int Socket {-1};
+#endif
+    QUIC_ADDR Address {};
+
+    IceNativeUdpReceiver()
+    {
+        Socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#ifdef _WIN32
+        if (Socket == INVALID_SOCKET) {
+            return;
+        }
+#else
+        if (Socket < 0) {
+            return;
+        }
+#endif
+        sockaddr_in NativeAddress = {};
+        NativeAddress.sin_family = AF_INET;
+        NativeAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(
+                Socket,
+                reinterpret_cast<const sockaddr*>(&NativeAddress),
+                sizeof(NativeAddress)) != 0) {
+            Close();
+            return;
+        }
+#ifdef _WIN32
+        int AddressLength = sizeof(NativeAddress);
+#else
+        socklen_t AddressLength = sizeof(NativeAddress);
+#endif
+        if (getsockname(
+                Socket,
+                reinterpret_cast<sockaddr*>(&NativeAddress),
+                &AddressLength) != 0) {
+            Close();
+            return;
+        }
+        CxPlatCopyMemory(&Address.Ipv4, &NativeAddress, sizeof(NativeAddress));
+    }
+
+    ~IceNativeUdpReceiver() { Close(); }
+
+    bool IsValid() const
+    {
+#ifdef _WIN32
+        return Socket != INVALID_SOCKET;
+#else
+        return Socket >= 0;
+#endif
+    }
+
+    int Receive(uint8_t* Buffer, uint32_t BufferLength, uint32_t TimeoutMs)
+    {
+#ifdef _WIN32
+        DWORD Timeout = TimeoutMs;
+        if (setsockopt(
+                Socket,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                reinterpret_cast<const char*>(&Timeout),
+                sizeof(Timeout)) != 0) {
+            return -1;
+        }
+        return recv(
+            Socket,
+            reinterpret_cast<char*>(Buffer),
+            (int)BufferLength,
+            0);
+#else
+        timeval Timeout = {
+            (time_t)(TimeoutMs / 1000),
+            (suseconds_t)((TimeoutMs % 1000) * 1000)};
+        if (setsockopt(
+                Socket,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &Timeout,
+                sizeof(Timeout)) != 0) {
+            return -1;
+        }
+        return (int)recv(Socket, Buffer, BufferLength, 0);
+#endif
+    }
+
+private:
+    void Close()
+    {
+#ifdef _WIN32
+        if (Socket != INVALID_SOCKET) {
+            closesocket(Socket);
+            Socket = INVALID_SOCKET;
+        }
+#else
+        if (Socket >= 0) {
+            close(Socket);
+            Socket = -1;
+        }
+#endif
+    }
+};
+
+bool
+FindControlPartition(
+    IceCallbackContext& Context,
+    IceNativeUdpReceiver& Receiver)
+{
+    for (uint16_t Partition = 0;
+         Partition < (uint16_t)CxPlatProcCount();
+         ++Partition) {
+        const QUIC_STATUS Status =
+            Context.Binding.SendControl(
+                Context.Binding.BindingContext,
+                Partition,
+                &Context.ControlRemoteAddress,
+                Context.ControlBytes.data(),
+                (uint32_t)Context.ControlBytes.size());
+        if (QUIC_SUCCEEDED(Status)) {
+            Context.ControlPartitionIndex.store(
+                Partition, std::memory_order_release);
+            std::array<uint8_t, 32> Received {};
+            return
+                Receiver.Receive(
+                    Received.data(), Received.size(), 2000) ==
+                (int)Context.ControlBytes.size();
+        }
+        EXPECT_EQ(QUIC_STATUS_NOT_SUPPORTED, Status);
+    }
+    return false;
 }
 
 void
@@ -555,6 +778,10 @@ TEST(IceDatapath, ConnectionConfigValidationAndStartedState)
     MsQuicConfiguration ClientConfiguration(
         Registration, Alpn, ClientCredConfig);
     ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
     ASSERT_TRUE(
         QUIC_SUCCEEDED(Connection.Start(
             ClientConfiguration,
@@ -575,6 +802,377 @@ TEST(IceDatapath, ConnectionConfigValidationAndStartedState)
     Connection.Close();
     ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
     EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, BoundCallbackCanSelectDirectAndSendControl)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceNativeUdpReceiver Receiver;
+    ASSERT_TRUE(Receiver.IsValid());
+
+    IceCallbackContext Context;
+    Context.SelectPathOnBound = true;
+    Context.BoundPath = QUIC_ICE_PATH_DIRECT;
+    Context.SendControlOnBound = true;
+    Context.ControlRemoteAddress = Receiver.Address;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.BoundPathStatus.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.BoundControlStatus.load(std::memory_order_acquire));
+
+    std::array<uint8_t, 32> Received {};
+    const int ReceivedLength =
+        Receiver.Receive(Received.data(), Received.size(), 2000);
+    ASSERT_EQ((int)Context.ControlBytes.size(), ReceivedLength);
+    EXPECT_EQ(
+        0,
+        memcmp(
+            Context.ControlBytes.data(),
+            Received.data(),
+            Context.ControlBytes.size()));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
+    Connection.Close();
+}
+
+TEST(IceDatapath, SelectedPathIsOneShotAndConcurrent)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    std::atomic<QUIC_STATUS> DirectStatus {QUIC_STATUS_ABORTED};
+    std::atomic<QUIC_STATUS> RelayStatus {QUIC_STATUS_ABORTED};
+    std::thread Direct([&]() {
+        DirectStatus.store(
+            Context.Binding.SetSelectedPath(
+                Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT),
+            std::memory_order_release);
+    });
+    std::thread Relay([&]() {
+        RelayStatus.store(
+            Context.Binding.SetSelectedPath(
+                Context.Binding.BindingContext, QUIC_ICE_PATH_RELAY),
+            std::memory_order_release);
+    });
+    Direct.join();
+    Relay.join();
+    const QUIC_STATUS First = DirectStatus.load(std::memory_order_acquire);
+    const QUIC_STATUS Second = RelayStatus.load(std::memory_order_acquire);
+    EXPECT_TRUE(
+        (First == QUIC_STATUS_SUCCESS && Second == QUIC_STATUS_INVALID_STATE) ||
+        (First == QUIC_STATUS_INVALID_STATE && Second == QUIC_STATUS_SUCCESS));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
+    Connection.Close();
+}
+
+TEST(IceDatapath, ListenerRejectsRelayButCanSelectDirect)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    MsQuicAlpn Alpn("ListenerPathEncoding");
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn));
+    EXPECT_EQ(
+        QUIC_STATUS_NOT_SUPPORTED,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_RELAY));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
+    Listener.Close();
+}
+
+TEST(IceDatapath, DirectPathUsesNativeUdpAndRelayPathUsesCallback)
+{
+    for (const QUIC_ICE_PATH_TYPE Path : {
+            QUIC_ICE_PATH_UNSELECTED,
+            QUIC_ICE_PATH_DIRECT,
+            QUIC_ICE_PATH_RELAY}) {
+        MsQuicRegistration Registration(true);
+        ASSERT_TRUE(Registration.IsValid());
+        IceNativeUdpReceiver Receiver;
+        ASSERT_TRUE(Receiver.IsValid());
+        IceCallbackContext Context;
+        auto Config = MakeIceConfig(&Context);
+        MsQuicConnection Connection(Registration);
+        ASSERT_TRUE(Connection.IsValid());
+        ASSERT_EQ(
+            QUIC_STATUS_SUCCESS,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+        if (Path != QUIC_ICE_PATH_UNSELECTED) {
+            ASSERT_EQ(
+                QUIC_STATUS_SUCCESS,
+                Context.Binding.SetSelectedPath(
+                    Context.Binding.BindingContext, Path));
+        }
+
+        MsQuicAlpn Alpn("IceSendRouting");
+        MsQuicCredentialConfig ClientCredConfig;
+        MsQuicConfiguration ClientConfiguration(
+            Registration, Alpn, ClientCredConfig);
+        ASSERT_TRUE(ClientConfiguration.IsValid());
+        ASSERT_TRUE(
+            QUIC_SUCCEEDED(Connection.Start(
+                ClientConfiguration,
+                QUIC_ADDRESS_FAMILY_INET,
+                "127.0.0.1",
+                QuicAddrGetPort(&Receiver.Address))));
+
+        std::array<uint8_t, MAX_UDP_PAYLOAD_LENGTH> Received {};
+        if (Path == QUIC_ICE_PATH_DIRECT) {
+            EXPECT_GT(
+                Receiver.Receive(Received.data(), Received.size(), 2000),
+                0);
+            EXPECT_EQ(
+                0u, Context.RelayCount.load(std::memory_order_acquire));
+        } else if (Path == QUIC_ICE_PATH_RELAY) {
+            EXPECT_TRUE(Context.RelayEvent.WaitTimeout(2000));
+            EXPECT_GT(
+                Context.RelayCount.load(std::memory_order_acquire), 0u);
+            EXPECT_GT(
+                Context.RelayBytes.load(std::memory_order_acquire), 0u);
+            EXPECT_LE(
+                Context.RelayMaxLength.load(std::memory_order_acquire),
+                1372u);
+            EXPECT_LT(
+                Receiver.Receive(Received.data(), Received.size(), 100),
+                0);
+        } else {
+            EXPECT_FALSE(Context.RelayEvent.WaitTimeout(100));
+            EXPECT_LT(
+                Receiver.Receive(Received.data(), Received.size(), 100),
+                0);
+        }
+        Connection.Close();
+    }
+}
+
+TEST(IceDatapath, RelayCallbackCanReenterControlWithoutRecursion)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceNativeUdpReceiver Receiver;
+    ASSERT_TRUE(Receiver.IsValid());
+    IceCallbackContext Context;
+    Context.ControlRemoteAddress = Receiver.Address;
+    Context.ReenterControlFromRelay.store(true, std::memory_order_release);
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    ASSERT_TRUE(FindControlPartition(Context, Receiver));
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_RELAY));
+
+    MsQuicAlpn Alpn("RelayControlBypass");
+    MsQuicCredentialConfig ClientCredConfig;
+    MsQuicConfiguration ClientConfiguration(
+        Registration, Alpn, ClientCredConfig);
+    ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_TRUE(
+        QUIC_SUCCEEDED(Connection.Start(
+            ClientConfiguration,
+            QUIC_ADDRESS_FAMILY_INET,
+            "127.0.0.1",
+            QuicAddrGetPort(&Receiver.Address))));
+    ASSERT_TRUE(Context.RelayEvent.WaitTimeout(2000));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.RelayControlStatus.load(std::memory_order_acquire));
+    std::array<uint8_t, 32> Received {};
+    ASSERT_EQ(
+        (int)Context.ControlBytes.size(),
+        Receiver.Receive(Received.data(), Received.size(), 2000));
+    EXPECT_EQ(1u, Context.RelayCount.load(std::memory_order_acquire));
+    Connection.Close();
+}
+
+TEST(IceDatapath, SendControlValidatesRouteAndClosingState)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceNativeUdpReceiver Receiver;
+    ASSERT_TRUE(Receiver.IsValid());
+    IceCallbackContext Context;
+    Context.ControlRemoteAddress = Receiver.Address;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    ASSERT_TRUE(FindControlPartition(Context, Receiver));
+    const uint16_t Partition =
+        Context.ControlPartitionIndex.load(std::memory_order_acquire);
+
+    uint16_t WrongPartition = UINT16_MAX;
+    for (uint16_t Candidate = 0;
+         Candidate < (uint16_t)CxPlatProcCount();
+         ++Candidate) {
+        if (Candidate != Partition) {
+            WrongPartition = Candidate;
+            break;
+        }
+    }
+    if (WrongPartition != UINT16_MAX) {
+        EXPECT_EQ(
+            QUIC_STATUS_NOT_SUPPORTED,
+            Context.Binding.SendControl(
+                Context.Binding.BindingContext,
+                WrongPartition,
+                &Context.ControlRemoteAddress,
+                Context.ControlBytes.data(),
+                (uint32_t)Context.ControlBytes.size()));
+    }
+
+    QUIC_ADDR Wildcard = {};
+    QuicAddrSetFamily(&Wildcard, QUIC_ADDRESS_FAMILY_INET);
+    QuicAddrSetPort(&Wildcard, 443);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.SendControl(
+            Context.Binding.BindingContext,
+            Partition,
+            &Wildcard,
+            Context.ControlBytes.data(),
+            (uint32_t)Context.ControlBytes.size()));
+    QUIC_ADDR ZeroPort = Context.ControlRemoteAddress;
+    QuicAddrSetPort(&ZeroPort, 0);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.SendControl(
+            Context.Binding.BindingContext,
+            Partition,
+            &ZeroPort,
+            Context.ControlBytes.data(),
+            (uint32_t)Context.ControlBytes.size()));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.SendControl(
+            Context.Binding.BindingContext,
+            Partition,
+            &Context.ControlRemoteAddress,
+            Context.ControlBytes.data(),
+            0));
+    std::vector<uint8_t> Oversize(MAX_UDP_PAYLOAD_LENGTH + 1, 0);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.SendControl(
+            Context.Binding.BindingContext,
+            Partition,
+            &Context.ControlRemoteAddress,
+            Oversize.data(),
+            (uint32_t)Oversize.size()));
+
+    // The relay MTU cap limits inner IPv4 QUIC payload to 1372. Even the
+    // larger Send Indication envelope remains within the 1472-byte CxPlat
+    // control datagram ceiling.
+    std::vector<uint8_t> MaxTurnEnvelope(1372 + 48, 0x55);
+    ASSERT_LE(MaxTurnEnvelope.size(), (size_t)MAX_UDP_PAYLOAD_LENGTH);
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SendControl(
+            Context.Binding.BindingContext,
+            Partition,
+            &Context.ControlRemoteAddress,
+            MaxTurnEnvelope.data(),
+            (uint32_t)MaxTurnEnvelope.size()));
+    std::vector<uint8_t> Received(MaxTurnEnvelope.size());
+    EXPECT_EQ(
+        (int)MaxTurnEnvelope.size(),
+        Receiver.Receive(Received.data(), Received.size(), 2000));
+
+    Context.SendControlOnUnbound = true;
+    Connection.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Context.UnboundControlStatus.load(std::memory_order_acquire));
+}
+
+TEST(IceDatapath, RelaySendRundownDrainsBeforeUnbound)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceNativeUdpReceiver Receiver;
+    ASSERT_TRUE(Receiver.IsValid());
+    IceCallbackContext Context;
+    Context.BlockRelay.store(true, std::memory_order_release);
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_RELAY));
+
+    MsQuicAlpn Alpn("RelaySendRundown");
+    MsQuicCredentialConfig ClientCredConfig;
+    MsQuicConfiguration ClientConfiguration(
+        Registration, Alpn, ClientCredConfig);
+    ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_TRUE(
+        QUIC_SUCCEEDED(Connection.Start(
+            ClientConfiguration,
+            QUIC_ADDRESS_FAMILY_INET,
+            "127.0.0.1",
+            QuicAddrGetPort(&Receiver.Address))));
+    if (!Context.RelayEntered.WaitTimeout(2000)) {
+        Context.AllowRelayReturn.Set();
+        Connection.Close();
+        ADD_FAILURE() << "relay callback did not enter";
+        return;
+    }
+
+    std::thread CloseThread([&]() { Connection.Close(); });
+    EXPECT_FALSE(Context.UnboundEvent.WaitTimeout(50));
+    Context.AllowRelayReturn.Set();
+    CloseThread.join();
+    EXPECT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_acquire));
 }
 
 TEST(IceDatapath, ListenerConfigValidationAndStartedState)
@@ -905,6 +1503,10 @@ TEST(IceDatapath, PreparedUnconnectedClient)
     MsQuicConfiguration ClientConfiguration(
         Registration, Alpn, ClientCredConfig);
     ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
     ASSERT_TRUE(
         QUIC_SUCCEEDED(Connection.Start(
             ClientConfiguration,

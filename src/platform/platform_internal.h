@@ -135,12 +135,6 @@ typedef struct CXPLAT_SEND_DATA_COMMON {
     uint16_t SegmentSize;
 } CXPLAT_SEND_DATA_COMMON;
 
-typedef enum CXPLAT_DATAPATH_TYPE {
-    CXPLAT_DATAPATH_TYPE_UNKNOWN = 0,
-    CXPLAT_DATAPATH_TYPE_NORMAL,
-    CXPLAT_DATAPATH_TYPE_RAW, // currently raw == xdp
-} CXPLAT_DATAPATH_TYPE;
-
 typedef enum CXPLAT_SOCKET_TYPE {
     CXPLAT_SOCKET_UDP             = 0,
     CXPLAT_SOCKET_TCP_LISTENER    = 1,
@@ -1181,6 +1175,25 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 SendDataIsFull(
     _In_ CXPLAT_SEND_DATA* SendData
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+SendDataEnumerateDatagrams(
+    _In_ CXPLAT_SEND_DATA* SendData,
+    _In_ uint32_t ExpectedDatagrams,
+    _In_ uint32_t ExpectedBytes,
+    _In_ CXPLAT_SEND_DATAGRAM_CALLBACK Callback,
+    _In_ void* Context
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+SocketGetRouteForPartition(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _Out_ CXPLAT_ROUTE* Route
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

@@ -1805,6 +1805,18 @@ QuicConnStart(
         return QUIC_STATUS_INVALID_STATE;
     }
 
+    // The prepared ICE socket MTU and local transport parameter must not be
+    // consumed until nomination has published DIRECT or RELAY. In particular,
+    // RELAY selection first caps the socket MTU before publishing the path.
+    if (Connection->IceDatapathConfigured &&
+        (Path->Binding == NULL ||
+         !QuicBindingIceSelectedPathIsReady(Path->Binding))) {
+        if (ServerName != NULL) {
+            CXPLAT_FREE(ServerName, QUIC_POOL_SERVERNAME);
+        }
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
 #ifdef QUIC_COMPARTMENT_ID
     if (Connection->IceDatapathConfigured &&
         Path->Binding != NULL &&
@@ -1994,6 +2006,14 @@ QuicConnStart(
 
     Connection->State.LocalAddressSet = TRUE;
     QuicBindingGetLocalAddress(Path->Binding, &Path->Route.LocalAddress);
+    if (Connection->IceDatapathConfigured &&
+        QuicAddrIsWildCard(&Path->Route.LocalAddress) &&
+        QuicAddrGetFamily(&Path->Route.LocalAddress) !=
+            QuicAddrGetFamily(&Path->Route.RemoteAddress)) {
+        QuicAddrSetFamily(
+            &Path->Route.LocalAddress,
+            QuicAddrGetFamily(&Path->Route.RemoteAddress));
+    }
     QuicTraceEvent(
         ConnLocalAddrAdded,
         "[conn][%p] New Local IP: %!ADDR!",

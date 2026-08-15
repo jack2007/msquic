@@ -508,6 +508,68 @@ CxPlatSendDataIsFull(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSendDataEnumerateDatagrams(
+    _In_ CXPLAT_SEND_DATA* SendData,
+    _In_ uint32_t ExpectedDatagrams,
+    _In_ uint32_t ExpectedBytes,
+    _In_ CXPLAT_SEND_DATAGRAM_CALLBACK Callback,
+    _In_ void* Context
+    )
+{
+    if (SendData == NULL || Callback == NULL || Context == NULL ||
+        ExpectedDatagrams == 0 || ExpectedBytes == 0) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    if (DatapathType(SendData) != CXPLAT_DATAPATH_TYPE_NORMAL) {
+        return QUIC_STATUS_NOT_SUPPORTED;
+    }
+    return
+        SendDataEnumerateDatagrams(
+            SendData,
+            ExpectedDatagrams,
+            ExpectedBytes,
+            Callback,
+            Context);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketGetRouteForPartition(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _Out_ CXPLAT_ROUTE* Route
+    )
+{
+    if (Socket == NULL || RemoteAddress == NULL || Route == NULL) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    return
+        SocketGetRouteForPartition(
+            Socket, PartitionIndex, RemoteAddress, Route);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketSetLocalMtuCap(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t Mtu
+    )
+{
+    if (Socket == NULL || Mtu < 1280 || Mtu > CXPLAT_MAX_MTU) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+    if (CxPlatDpRawIsRawDatapathOnly(Socket->Datapath->RawDataPath)) {
+        return QUIC_STATUS_NOT_SUPPORTED;
+    }
+    if (Socket->Mtu > Mtu) {
+        Socket->Mtu = Mtu;
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 void
 CxPlatSocketSend(
     _In_ CXPLAT_SOCKET* Socket,

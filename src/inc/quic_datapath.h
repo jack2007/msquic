@@ -170,6 +170,12 @@ typedef struct CXPLAT_SOCKET CXPLAT_SOCKET;
 //
 typedef struct CXPLAT_SEND_DATA CXPLAT_SEND_DATA;
 
+typedef enum CXPLAT_DATAPATH_TYPE {
+    CXPLAT_DATAPATH_TYPE_UNKNOWN = 0,
+    CXPLAT_DATAPATH_TYPE_NORMAL,
+    CXPLAT_DATAPATH_TYPE_RAW,
+} CXPLAT_DATAPATH_TYPE;
+
 //
 // Contains a pointer and length.
 //
@@ -846,6 +852,53 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 CxPlatSendDataIsFull(
     _In_ CXPLAT_SEND_DATA* SendData
+    );
+
+typedef
+QUIC_STATUS
+(QUIC_API *CXPLAT_SEND_DATAGRAM_CALLBACK)(
+    _In_ void* Context,
+    _In_reads_bytes_(BufferLength) const uint8_t* Buffer,
+    _In_ uint16_t BufferLength
+    );
+
+//
+// Finalizes and synchronously enumerates the UDP datagrams represented by a
+// normal datapath send context. The callback only borrows each buffer for the
+// duration of the call. Structural validation completes before any callback.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSendDataEnumerateDatagrams(
+    _In_ CXPLAT_SEND_DATA* SendData,
+    _In_ uint32_t ExpectedDatagrams,
+    _In_ uint32_t ExpectedBytes,
+    _In_ CXPLAT_SEND_DATAGRAM_CALLBACK Callback,
+    _In_ void* Context
+    );
+
+//
+// Builds a normal resolved route for the socket context whose actual worker
+// partition matches PartitionIndex.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketGetRouteForPartition(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _Out_ CXPLAT_ROUTE* Route
+    );
+
+//
+// Applies a local MTU ceiling before a relay path is published. The QUIC
+// transport parameter is derived from this socket MTU at connection start.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+CxPlatSocketSetLocalMtuCap(
+    _In_ CXPLAT_SOCKET* Socket,
+    _In_ uint16_t Mtu
     );
 
 //
