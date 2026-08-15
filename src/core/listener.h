@@ -5,6 +5,8 @@
 
 --*/
 
+#include "msquic_ice.h"
+
 //
 // Represents the Listener specific state.
 //
@@ -73,6 +75,13 @@ typedef struct QUIC_LISTENER {
     // The top level registration.
     //
     QUIC_REGISTRATION* Registration;
+
+    //
+    // Private ICE config copied before listener start. Binding registration
+    // atomically validates/installs this config for shared sockets.
+    //
+    QUIC_ICE_DATAPATH_CONFIG_V1 IceDatapathConfig;
+    BOOLEAN IceDatapathConfigured;
 
     //
     // Link into the registrations's list of listeners.

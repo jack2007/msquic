@@ -8,6 +8,18 @@
 typedef struct QUIC_PARTITIONED_HASHTABLE QUIC_PARTITIONED_HASHTABLE;
 typedef struct QUIC_STATELESS_CONTEXT QUIC_STATELESS_CONTEXT;
 
+#include "msquic_ice.h"
+
+typedef struct QUIC_ICE_EXTENSION {
+    QUIC_ICE_DATAPATH_CONFIG_V1 Config;
+    QUIC_ICE_BINDING_API_V1 BindingApi;
+    CXPLAT_RUNDOWN_REF UpcallRundown;
+    volatile long PathType;
+    volatile long Closing;
+    BOOLEAN Configured;
+    BOOLEAN Bound;
+} QUIC_ICE_EXTENSION;
+
 //
 // Structure that MsQuic servers use for encoding data for stateless retries and
 // NEW_TOKEN data.
@@ -224,6 +236,13 @@ typedef struct QUIC_BINDING {
     uint32_t RefCount;
 
     //
+    // Optional private ICE datapath extension. UpcallRundown is initialized
+    // for every binding so later receive/send hooks can acquire it without
+    // racing binding teardown.
+    //
+    QUIC_ICE_EXTENSION IceExtension;
+
+    //
     // A randomly created reserved version.
     //
     uint32_t RandomReservedVersion;
@@ -285,6 +304,32 @@ typedef struct QUIC_BINDING {
 #endif
 
 } QUIC_BINDING;
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicBindingAttachIceExtension(
+    _In_ QUIC_BINDING* Binding,
+    _In_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+const QUIC_ICE_DATAPATH_CONFIG_V1*
+QuicBindingIceAcquireUpcall(
+    _In_ QUIC_BINDING* Binding
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+QuicBindingIceReleaseUpcall(
+    _In_ QUIC_BINDING* Binding
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+QuicIceDatapathConfigIsValid(
+    _In_ uint32_t BufferLength,
+    _In_reads_bytes_(BufferLength) const void* Buffer
+    );
 
 //
 // Global callbacks for all QUIC UDP bindings.

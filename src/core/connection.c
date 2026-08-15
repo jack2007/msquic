@@ -1925,6 +1925,17 @@ QuicConnStart(
         goto Exit;
     }
 
+    Status =
+        QuicBindingAttachIceExtension(
+            Path->Binding,
+            Connection->IceDatapathConfigured ?
+                &Connection->IceDatapathConfig : NULL);
+    if (QUIC_FAILED(Status)) {
+        QuicLibraryReleaseBinding(Path->Binding);
+        Path->Binding = NULL;
+        goto Exit;
+    }
+
     //
     // Clients only need to generate a non-zero length source CID if it
     // intends to share the UDP binding.
@@ -6394,6 +6405,24 @@ QuicConnParamSet(
     QUIC_SETTINGS_INTERNAL InternalSettings = {0};
 
     switch (Param) {
+
+    case QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG:
+
+        if (!QuicIceDatapathConfigIsValid(BufferLength, Buffer)) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (Connection->State.Started || Connection->State.ClosedLocally) {
+            Status = QUIC_STATUS_INVALID_STATE;
+            break;
+        }
+
+        Connection->IceDatapathConfig =
+            *(const QUIC_ICE_DATAPATH_CONFIG_V1*)Buffer;
+        Connection->IceDatapathConfigured = TRUE;
+        Status = QUIC_STATUS_SUCCESS;
+        break;
 
     case QUIC_PARAM_CONN_LOCAL_ADDRESS: {
 

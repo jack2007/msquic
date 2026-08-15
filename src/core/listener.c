@@ -862,6 +862,20 @@ QuicListenerParamSet(
         const void* Buffer
     )
 {
+    if (Param == QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG) {
+        if (!QuicIceDatapathConfigIsValid(BufferLength, Buffer)) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+        if (!Listener->Stopped) {
+            return QUIC_STATUS_INVALID_STATE;
+        }
+
+        Listener->IceDatapathConfig =
+            *(const QUIC_ICE_DATAPATH_CONFIG_V1*)Buffer;
+        Listener->IceDatapathConfigured = TRUE;
+        return QUIC_STATUS_SUCCESS;
+    }
+
     if (Param == QUIC_PARAM_LISTENER_CIBIR_ID) {
         if (BufferLength > QUIC_MAX_CIBIR_LENGTH + 1) {
             return QUIC_STATUS_INVALID_PARAMETER;

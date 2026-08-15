@@ -55,6 +55,8 @@ QuicBindingInitialize(
         goto Error;
     }
 
+    CxPlatZeroMemory(Binding, sizeof(*Binding));
+
     Binding->RefCount = 0; // No refs until it's added to the library's list
     Binding->Exclusive = !(UdpConfig->Flags & CXPLAT_SOCKET_FLAG_SHARE);
     Binding->ServerOwned = !!(UdpConfig->Flags & CXPLAT_SOCKET_SERVER_OWNED);
@@ -66,6 +68,7 @@ QuicBindingInitialize(
     Binding->StatelessOperCount = 0;
     CxPlatDispatchRwLockInitialize(&Binding->RwLock);
     CxPlatDispatchLockInitialize(&Binding->StatelessOperLock);
+    CxPlatRundownInitialize(&Binding->IceExtension.UpcallRundown);
     CxPlatListInitializeHead(&Binding->Listeners);
     QuicLookupInitialize(&Binding->Lookup);
 #if DEBUG
@@ -187,6 +190,7 @@ Error:
 #endif
             CxPlatDispatchLockUninitialize(&Binding->StatelessOperLock);
             CxPlatDispatchRwLockUninitialize(&Binding->RwLock);
+            CxPlatRundownUninitialize(&Binding->IceExtension.UpcallRundown);
             CXPLAT_FREE(Binding, QUIC_POOL_BINDING);
         }
     }
@@ -209,9 +213,27 @@ QuicBindingUninitialize(
     CXPLAT_TEL_ASSERT(CxPlatListIsEmpty(&Binding->Listeners));
 
     //
-    // Delete the datapath binding. This function blocks until all receive
-    // upcalls have completed.
+    // Stop new ICE callbacks and wait for all callbacks already dispatched by
+    // receive/send hooks to return. Task 2 has no such call sites yet, so the
+    // rundown is normally empty; Task 4/5 use the acquire/release helpers.
     //
+    (void)InterlockedCompareExchange(
+        &Binding->IceExtension.Closing, TRUE, FALSE);
+    CxPlatRundownReleaseAndWait(&Binding->IceExtension.UpcallRundown);
+
+    //
+    // The extension context may own state used by the socket. Notify it only
+    // after extension upcalls drain, but before deleting the socket. Socket
+    // deletion then blocks until all platform receive upcalls have completed;
+    // any late receive upcall fails the ICE rundown acquire and bypasses the
+    // extension.
+    //
+    if (Binding->IceExtension.Configured && Binding->IceExtension.Bound) {
+        Binding->IceExtension.Config.Unbound(
+            Binding->IceExtension.Config.Context);
+        Binding->IceExtension.Bound = FALSE;
+    }
+
     CxPlatSocketDelete(Binding->Socket);
 
     //
@@ -241,12 +263,234 @@ QuicBindingUninitialize(
     QuicLibraryUntrackDbgObject(QUIC_DBG_OBJECT_TYPE_BINDING, &Binding->DbgObjectLink);
 #endif
     CxPlatDispatchRwLockUninitialize(&Binding->RwLock);
+    CxPlatRundownUninitialize(&Binding->IceExtension.UpcallRundown);
 
     QuicTraceEvent(
         BindingDestroyed,
         "[bind][%p] Destroyed",
         Binding);
     CXPLAT_FREE(Binding, QUIC_POOL_BINDING);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+QuicIceDatapathConfigIsValid(
+    _In_ uint32_t BufferLength,
+    _In_reads_bytes_(BufferLength) const void* Buffer
+    )
+{
+    if (Buffer == NULL || BufferLength != sizeof(QUIC_ICE_DATAPATH_CONFIG_V1)) {
+        return FALSE;
+    }
+
+    const QUIC_ICE_DATAPATH_CONFIG_V1* Config =
+        (const QUIC_ICE_DATAPATH_CONFIG_V1*)Buffer;
+    return
+        Config->Size == sizeof(*Config) &&
+        Config->Version == QUIC_ICE_DATAPATH_VERSION_1 &&
+        Config->Receive != NULL &&
+        Config->SendRelayDatagram != NULL &&
+        Config->Bound != NULL &&
+        Config->Unbound != NULL;
+}
+
+static
+BOOLEAN
+QuicBindingIceConfigIsCompatible(
+    _In_ const QUIC_ICE_DATAPATH_CONFIG_V1* Left,
+    _In_ const QUIC_ICE_DATAPATH_CONFIG_V1* Right
+    )
+{
+    return
+        Left->Size == Right->Size &&
+        Left->Version == Right->Version &&
+        Left->Context == Right->Context &&
+        Left->Receive == Right->Receive &&
+        Left->SendRelayDatagram == Right->SendRelayDatagram &&
+        Left->Bound == Right->Bound &&
+        Left->Unbound == Right->Unbound;
+}
+
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIceSendControl(
+    _In_ void* BindingContext,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _In_reads_bytes_(BufferLength) const uint8_t* Buffer,
+    _In_ uint32_t BufferLength
+    );
+
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIceSetSelectedPath(
+    _In_ void* BindingContext,
+    _In_ QUIC_ICE_PATH_TYPE PathType
+    );
+
+static
+QUIC_STATUS
+QuicBindingPrepareIceExtensionLocked(
+    _In_ QUIC_BINDING* Binding,
+    _In_opt_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config,
+    _Out_ BOOLEAN* InvokeBound
+    )
+{
+    *InvokeBound = FALSE;
+    QUIC_ICE_EXTENSION* Extension = &Binding->IceExtension;
+
+    if (Extension->Closing) {
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    if (Config == NULL) {
+        return Extension->Configured ?
+            QUIC_STATUS_INVALID_STATE : QUIC_STATUS_SUCCESS;
+    }
+
+    if (Extension->Configured) {
+        return
+            Extension->Bound &&
+            QuicBindingIceConfigIsCompatible(&Extension->Config, Config) ?
+                QUIC_STATUS_SUCCESS : QUIC_STATUS_INVALID_STATE;
+    }
+
+    // Never retrofit an ICE context onto a binding already serving legacy
+    // listeners. The inverse direction is rejected by the Config == NULL path
+    // above, keeping shared binding semantics symmetric.
+    if (!CxPlatListIsEmpty(&Binding->Listeners)) {
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    Extension->Config = *Config;
+    Extension->BindingApi.Size = sizeof(Extension->BindingApi);
+    Extension->BindingApi.Version = QUIC_ICE_DATAPATH_VERSION_1;
+    Extension->BindingApi.BindingContext = Binding;
+    Extension->BindingApi.SendControl = QuicBindingIceSendControl;
+    Extension->BindingApi.SetSelectedPath = QuicBindingIceSetSelectedPath;
+    Extension->Configured = TRUE;
+    *InvokeBound = TRUE;
+    return QUIC_STATUS_SUCCESS;
+}
+
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIceSendControl(
+    _In_ void* BindingContext,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ADDR* RemoteAddress,
+    _In_reads_bytes_(BufferLength) const uint8_t* Buffer,
+    _In_ uint32_t BufferLength
+    )
+{
+    UNREFERENCED_PARAMETER(PartitionIndex);
+    if (BindingContext == NULL || RemoteAddress == NULL ||
+        Buffer == NULL || BufferLength == 0) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    QUIC_BINDING* Binding = (QUIC_BINDING*)BindingContext;
+    if (Binding->IceExtension.Closing) {
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    // Task 5 replaces this fail-closed stub with the internal-bypass CxPlat
+    // send path. Exposing the versioned function slot now keeps the ABI stable.
+    return QUIC_STATUS_NOT_SUPPORTED;
+}
+
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIceSetSelectedPath(
+    _In_ void* BindingContext,
+    _In_ QUIC_ICE_PATH_TYPE PathType
+    )
+{
+    if (BindingContext == NULL ||
+        (PathType != QUIC_ICE_PATH_DIRECT && PathType != QUIC_ICE_PATH_RELAY)) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    QUIC_BINDING* Binding = (QUIC_BINDING*)BindingContext;
+    if (Binding->IceExtension.Closing || !Binding->IceExtension.Configured) {
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    long PreviousPathType;
+    do {
+        PreviousPathType = Binding->IceExtension.PathType;
+    } while (InterlockedCompareExchange(
+                 &Binding->IceExtension.PathType,
+                 (long)PathType,
+                 PreviousPathType) != PreviousPathType);
+    return QUIC_STATUS_SUCCESS;
+}
+
+static
+void
+QuicBindingInvokeIceBound(
+    _In_ QUIC_BINDING* Binding
+    )
+{
+    QUIC_ADDR LocalAddress;
+    QuicBindingGetLocalAddress(Binding, &LocalAddress);
+    Binding->IceExtension.Config.Bound(
+        Binding->IceExtension.Config.Context,
+        &Binding->IceExtension.BindingApi,
+        &LocalAddress);
+
+    CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);
+    Binding->IceExtension.Bound = TRUE;
+    CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicBindingAttachIceExtension(
+    _In_ QUIC_BINDING* Binding,
+    _In_opt_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config
+    )
+{
+    BOOLEAN InvokeBound;
+    CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);
+    QUIC_STATUS Status =
+        QuicBindingPrepareIceExtensionLocked(Binding, Config, &InvokeBound);
+    CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
+
+    if (InvokeBound) {
+        QuicBindingInvokeIceBound(Binding);
+    }
+    return Status;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+const QUIC_ICE_DATAPATH_CONFIG_V1*
+QuicBindingIceAcquireUpcall(
+    _In_ QUIC_BINDING* Binding
+    )
+{
+    const QUIC_ICE_DATAPATH_CONFIG_V1* Config = NULL;
+    CxPlatDispatchRwLockAcquireShared(&Binding->RwLock, PrevIrql);
+    if (Binding->IceExtension.Configured &&
+        Binding->IceExtension.Bound &&
+        CxPlatRundownAcquire(&Binding->IceExtension.UpcallRundown)) {
+        Config = &Binding->IceExtension.Config;
+    }
+    CxPlatDispatchRwLockReleaseShared(&Binding->RwLock, PrevIrql);
+    return Config;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+QuicBindingIceReleaseUpcall(
+    _In_ QUIC_BINDING* Binding
+    )
+{
+    CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -342,6 +586,7 @@ QuicBindingRegisterListener(
 {
     QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
     BOOLEAN MaximizeLookup = FALSE;
+    BOOLEAN InvokeIceBound = FALSE;
 
     const QUIC_ADDR* NewAddr = &NewListener->LocalAddress;
     const BOOLEAN NewWildCard = NewListener->WildCard;
@@ -399,6 +644,15 @@ QuicBindingRegisterListener(
     }
 
     if (Status == QUIC_STATUS_SUCCESS) {
+        Status =
+            QuicBindingPrepareIceExtensionLocked(
+                Binding,
+                NewListener->IceDatapathConfigured ?
+                    &NewListener->IceDatapathConfig : NULL,
+                &InvokeIceBound);
+    }
+
+    if (Status == QUIC_STATUS_SUCCESS) {
         MaximizeLookup = CxPlatListIsEmpty(&Binding->Listeners);
 
         //
@@ -418,6 +672,14 @@ QuicBindingRegisterListener(
     }
 
     CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
+
+    // Never invoke application code while holding the binding lock. The ICE
+    // config install and listener insertion above are one atomic operation,
+    // so a concurrent legacy or incompatible listener cannot slip between
+    // validation and registration.
+    if (InvokeIceBound) {
+        QuicBindingInvokeIceBound(Binding);
+    }
 
     if (MaximizeLookup &&
         !QuicLookupMaximizePartitioning(&Binding->Lookup)) {

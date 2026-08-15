@@ -8,6 +8,8 @@
 #include "connection.h.clog.h"
 #endif
 
+#include "msquic_ice.h"
+
 typedef struct QUIC_LISTENER QUIC_LISTENER;
 
 //
@@ -391,6 +393,12 @@ typedef struct QUIC_CONNECTION {
     // The configuration for this connection.
     //
     QUIC_CONFIGURATION* Configuration;
+
+    //
+    // Private ICE config copied before the client binding is created.
+    //
+    QUIC_ICE_DATAPATH_CONFIG_V1 IceDatapathConfig;
+    BOOLEAN IceDatapathConfigured;
 
     //
     // The settings for this connection. Some values may be inherited from the
