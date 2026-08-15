@@ -132,12 +132,44 @@ QuicOperationFree(
         CxPlatPoolFree(ApiCtx);
     } else if (Oper->Type == QUIC_OPER_TYPE_FLUSH_STREAM_RECV) {
         QuicStreamRelease(Oper->FLUSH_STREAM_RECEIVE.Stream, QUIC_STREAM_REF_OPERATION);
-    } else if (Oper->Type >= QUIC_OPER_TYPE_VERSION_NEGOTIATION) {
+    } else if (QuicOperationIsStateless(Oper->Type)) {
         if (Oper->STATELESS.Context != NULL) {
             QuicBindingReleaseStatelessOperation(Oper->STATELESS.Context, TRUE);
         }
+    } else if (Oper->Type == QUIC_OPER_TYPE_ICE && Oper->ICE.OwnsContext) {
+        QuicOperationCompleteIce(Oper, FALSE);
     }
     CxPlatPoolFree(Oper);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicOperationCompleteIce(
+    _In_ QUIC_OPERATION* Oper,
+    _In_ BOOLEAN Execute
+    )
+{
+    CXPLAT_DBG_ASSERT(Oper->Type == QUIC_OPER_TYPE_ICE);
+    CXPLAT_DBG_ASSERT(Oper->ICE.OwnsContext);
+    CXPLAT_DBG_ASSERT(Oper->ICE.HasRundown);
+    CXPLAT_DBG_ASSERT(Oper->ICE.HasBindingRef);
+
+    QUIC_BINDING* Binding = Oper->ICE.Binding;
+    QUIC_ICE_OPERATION_CALLBACK Callback =
+        Execute ? Oper->ICE.Operation.Execute : Oper->ICE.Operation.Cancel;
+    void* Context = Oper->ICE.Operation.Context;
+
+    // Clear ownership before invoking host code so reentrant APIs cannot make
+    // cleanup invoke the opposite callback.
+    Oper->ICE.OwnsContext = FALSE;
+    Callback(Context);
+
+    Oper->ICE.HasRundown = FALSE;
+    CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+    Oper->ICE.HasBindingRef = FALSE;
+    // This may synchronously uninitialize Binding and therefore must be the
+    // final access to it.
+    QuicLibraryReleaseBinding(Binding);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

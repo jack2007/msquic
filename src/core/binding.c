@@ -353,6 +353,15 @@ QuicBindingIceSetSelectedPath(
 
 static
 QUIC_STATUS
+QUIC_API
+QuicBindingIcePostOperation(
+    _In_ void* BindingContext,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ICE_OPERATION_V1* Operation
+    );
+
+static
+QUIC_STATUS
 QuicBindingPrepareIceExtensionLocked(
     _In_ QUIC_BINDING* Binding,
     _In_opt_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config,
@@ -393,6 +402,7 @@ QuicBindingPrepareIceExtensionLocked(
     Extension->BindingApi.BindingContext = Binding;
     Extension->BindingApi.SendControl = QuicBindingIceSendControl;
     Extension->BindingApi.SetSelectedPath = QuicBindingIceSetSelectedPath;
+    Extension->BindingApi.PostOperation = QuicBindingIcePostOperation;
     Extension->Configured = TRUE;
     Extension->Installing = TRUE;
     Token->FirstInstall = TRUE;
@@ -576,6 +586,75 @@ QuicBindingIceSetSelectedPath(
     return QUIC_STATUS_SUCCESS;
 }
 
+static
+QUIC_STATUS
+QUIC_API
+QuicBindingIcePostOperation(
+    _In_ void* BindingContext,
+    _In_ uint16_t PartitionIndex,
+    _In_ const QUIC_ICE_OPERATION_V1* Operation
+    )
+{
+    if (BindingContext == NULL || Operation == NULL ||
+        Operation->Size != sizeof(*Operation) ||
+        Operation->Version != QUIC_ICE_DATAPATH_VERSION_1 ||
+        Operation->Context == NULL || Operation->Execute == NULL ||
+        Operation->Cancel == NULL) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    QUIC_BINDING* Binding = (QUIC_BINDING*)BindingContext;
+    QUIC_WORKER_POOL* WorkerPool = Binding->IceExtension.WorkerPool;
+    if (WorkerPool == NULL) {
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    if (PartitionIndex >= WorkerPool->WorkerCount ||
+        (Binding->Exclusive && !Binding->ServerOwned &&
+            (!Binding->Partitioned ||
+             Binding->PartitionIndex != PartitionIndex))) {
+        return QUIC_STATUS_INVALID_PARAMETER;
+    }
+
+    QUIC_WORKER* Worker = &WorkerPool->Workers[PartitionIndex];
+    // Complete every fallible allocation before acquiring the binding upcall
+    // rundown. Operation allocation uses the exact target partition pool.
+    QUIC_OPERATION* InternalOperation =
+        QuicOperationAlloc(Worker->Partition, QUIC_OPER_TYPE_ICE);
+    if (InternalOperation == NULL) {
+        InterlockedIncrement64((int64_t*)&Worker->IceOperationsDropped);
+        return QUIC_STATUS_OUT_OF_MEMORY;
+    }
+    InternalOperation->ICE.Binding = Binding;
+    InternalOperation->ICE.Operation = *Operation;
+    InternalOperation->ICE.OwnsContext = FALSE;
+    InternalOperation->ICE.HasRundown = FALSE;
+    InternalOperation->ICE.HasBindingRef = FALSE;
+
+    if (!CxPlatRundownAcquire(&Binding->IceExtension.UpcallRundown)) {
+        QuicOperationFree(InternalOperation);
+        return QUIC_STATUS_INVALID_STATE;
+    }
+    InternalOperation->ICE.HasRundown = TRUE;
+
+    if (QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing) ||
+        !Binding->IceExtension.Configured) {
+        InternalOperation->ICE.HasRundown = FALSE;
+        CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+        QuicOperationFree(InternalOperation);
+        return QUIC_STATUS_INVALID_STATE;
+    }
+
+    const QUIC_STATUS Status =
+        QuicWorkerQueueIceOperation(Worker, InternalOperation);
+    if (QUIC_FAILED(Status)) {
+        InternalOperation->ICE.HasRundown = FALSE;
+        CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+        QuicOperationFree(InternalOperation);
+    }
+    return Status;
+}
+
 _IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_STATUS
 QuicBindingReserveIceExtension(
@@ -626,6 +705,7 @@ QuicBindingAbortIceExtension(
         CxPlatZeroMemory(
             &Binding->IceExtension.BindingApi,
             sizeof(Binding->IceExtension.BindingApi));
+        Binding->IceExtension.WorkerPool = NULL;
         Binding->IceExtension.Configured = FALSE;
         Binding->IceExtension.Installing = FALSE;
     }
@@ -650,12 +730,34 @@ QuicBindingCommitIceExtension(
         return QUIC_STATUS_SUCCESS;
     }
 
+    QUIC_STATUS Status = QuicLibraryEnsureStatelessRegistration();
+    if (QUIC_FAILED(Status)) {
+        QuicBindingAbortIceExtension(Binding, Token);
+        return Status;
+    }
+
+    CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);
+    if (!Binding->IceExtension.Configured ||
+        !Binding->IceExtension.Installing ||
+        Binding->IceExtension.Closing) {
+        Status = QUIC_STATUS_INVALID_STATE;
+    } else {
+        CXPLAT_FRE_ASSERT(MsQuicLib.StatelessRegistration != NULL);
+        Binding->IceExtension.WorkerPool =
+            MsQuicLib.StatelessRegistration->WorkerPool;
+    }
+    CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
+    if (QUIC_FAILED(Status)) {
+        QuicBindingAbortIceExtension(Binding, Token);
+        return Status;
+    }
+
     if (!QuicLibraryTryAddRefBinding(Binding)) {
         QuicBindingAbortIceExtension(Binding, Token);
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
+    Status = QUIC_STATUS_SUCCESS;
     QUIC_ICE_DATAPATH_CONFIG_V1 Config;
     const QUIC_ICE_BINDING_API_V1* BindingApi = NULL;
     CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);

@@ -441,6 +441,53 @@ QuicWorkerQueueOperation(
     }
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QuicWorkerQueueIceOperation(
+    _In_ QUIC_WORKER* Worker,
+    _In_ QUIC_OPERATION* Operation
+    )
+{
+    CXPLAT_DBG_ASSERT(Operation->Type == QUIC_OPER_TYPE_ICE);
+    CXPLAT_DBG_ASSERT(Operation->ICE.HasRundown);
+    CXPLAT_DBG_ASSERT(!Operation->ICE.HasBindingRef);
+    CXPLAT_DBG_ASSERT(!Operation->ICE.OwnsContext);
+
+    QUIC_STATUS Status;
+    BOOLEAN WakeWorkerThread = FALSE;
+    CxPlatDispatchLockAcquire(&Worker->Lock);
+
+    if (!Worker->Enabled) {
+        Status = QUIC_STATUS_INVALID_STATE;
+    } else if (Worker->IceOperationCount >=
+            QUIC_MAX_ICE_OPERATIONS_PER_WORKER) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+    } else if (!QuicLibraryTryAddRefBinding(Operation->ICE.Binding)) {
+        Status = QUIC_STATUS_INVALID_STATE;
+    } else {
+        // All fallible admission is complete. From this point ownership is
+        // transferred and the operation is either executed or cancelled.
+        Operation->ICE.HasBindingRef = TRUE;
+        Operation->ICE.OwnsContext = TRUE;
+        WakeWorkerThread = QuicWorkerIsIdle(Worker);
+        CxPlatListInsertTail(&Worker->Operations, &Operation->Link);
+        Worker->IceOperationCount++;
+        InterlockedIncrement64((int64_t*)&Worker->IceOperationsQueued);
+        Status = QUIC_STATUS_SUCCESS;
+    }
+
+    if (QUIC_FAILED(Status)) {
+        InterlockedIncrement64((int64_t*)&Worker->IceOperationsDropped);
+    }
+
+    CxPlatDispatchLockRelease(&Worker->Lock);
+
+    if (WakeWorkerThread) {
+        QuicWorkerThreadWake(Worker);
+    }
+    return Status;
+}
+
 _IRQL_requires_max_(PASSIVE_LEVEL)
 void
 QuicWorkerUpdateQueueDelay(
@@ -537,16 +584,27 @@ QuicWorkerGetNextOperation(
 {
     QUIC_OPERATION* Operation = NULL;
 
-    if (Worker->Enabled && Worker->OperationCount != 0) {
+    if (Worker->Enabled &&
+        !CxPlatListIsEmptyNoFence(&Worker->Operations)) {
         CxPlatDispatchLockAcquire(&Worker->Lock);
-        Operation =
-            CXPLAT_CONTAINING_RECORD(
-                CxPlatListRemoveHead(&Worker->Operations), QUIC_OPERATION, Link);
+        if (!CxPlatListIsEmpty(&Worker->Operations)) {
+            Operation =
+                CXPLAT_CONTAINING_RECORD(
+                    CxPlatListRemoveHead(&Worker->Operations), QUIC_OPERATION, Link);
 #if DEBUG
-        Operation->Link.Flink = NULL;
+            Operation->Link.Flink = NULL;
 #endif
-        Worker->OperationCount--;
-        QuicPerfCounterDecrement(Worker->Partition, QUIC_PERF_COUNTER_WORK_OPER_QUEUE_DEPTH);
+            if (Operation->Type == QUIC_OPER_TYPE_ICE) {
+                CXPLAT_DBG_ASSERT(Worker->IceOperationCount != 0);
+                Worker->IceOperationCount--;
+            } else {
+                CXPLAT_DBG_ASSERT(Worker->OperationCount != 0);
+                Worker->OperationCount--;
+                QuicPerfCounterDecrement(
+                    Worker->Partition,
+                    QUIC_PERF_COUNTER_WORK_OPER_QUEUE_DEPTH);
+            }
+        }
         CxPlatDispatchLockRelease(&Worker->Lock);
     }
 
@@ -826,8 +884,15 @@ QuicWorkerLoopCleanup(
 #if DEBUG
         Operation->Link.Flink = NULL;
 #endif
+        if (Operation->Type == QUIC_OPER_TYPE_ICE) {
+            CXPLAT_DBG_ASSERT(Worker->IceOperationCount != 0);
+            Worker->IceOperationCount--;
+        } else {
+            CXPLAT_DBG_ASSERT(Worker->OperationCount != 0);
+            Worker->OperationCount--;
+            --Dequeue;
+        }
         QuicOperationFree(Operation);
-        --Dequeue;
     }
     QuicPerfCounterAdd(Worker->Partition, QUIC_PERF_COUNTER_WORK_OPER_QUEUE_DEPTH, Dequeue);
 }
@@ -894,11 +959,19 @@ QuicWorkerLoop(
 
     QUIC_OPERATION* Operation = QuicWorkerGetNextOperation(Worker);
     if (Operation != NULL) {
-        QuicBindingProcessStatelessOperation(
-            Operation->Type,
-            Operation->STATELESS.Context);
+        if (Operation->Type == QUIC_OPER_TYPE_ICE) {
+            QuicOperationCompleteIce(Operation, TRUE);
+            InterlockedIncrement64((int64_t*)&Worker->IceOperationsCompleted);
+        } else {
+            CXPLAT_DBG_ASSERT(QuicOperationIsStateless(Operation->Type));
+            QuicBindingProcessStatelessOperation(
+                Operation->Type,
+                Operation->STATELESS.Context);
+            QuicPerfCounterIncrement(
+                Worker->Partition,
+                QUIC_PERF_COUNTER_WORK_OPER_COMPLETED);
+        }
         QuicOperationFree(Operation);
-        QuicPerfCounterIncrement(Worker->Partition, QUIC_PERF_COUNTER_WORK_OPER_COMPLETED);
         Worker->ExecutionContext.Ready = TRUE;
         State->NoWorkCount = 0;
     }

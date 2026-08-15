@@ -84,7 +84,16 @@ typedef struct QUIC_CACHEALIGN QUIC_WORKER {
     uint32_t OperationCount;
     uint64_t DroppedOperationCount;
 
+    // ICE operations have an independent quota so they cannot consume the
+    // retry/reset/version-negotiation budget.
+    uint32_t IceOperationCount;
+    uint64_t IceOperationsQueued;
+    uint64_t IceOperationsCompleted;
+    uint64_t IceOperationsDropped;
+
 } QUIC_WORKER;
+
+#define QUIC_MAX_ICE_OPERATIONS_PER_WORKER 256U
 
 //
 // A set of workers.
@@ -214,6 +223,13 @@ QuicWorkerQueueListener(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
 QuicWorkerQueueOperation(
+    _In_ QUIC_WORKER* Worker,
+    _In_ QUIC_OPERATION* Operation
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QuicWorkerQueueIceOperation(
     _In_ QUIC_WORKER* Worker,
     _In_ QUIC_OPERATION* Operation
     );

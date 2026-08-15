@@ -14,7 +14,9 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <thread>
+#include <vector>
 #ifdef __linux__
 #include <netinet/udp.h>
 #endif
@@ -28,6 +30,17 @@ QuicBindingIceGetTestState(
     uint16_t* LocalMtu,
     uint64_t* SendExtensionDrops,
     uint64_t* RecvExtensionDrops);
+
+extern "C"
+BOOLEAN
+QuicBindingIceGetWorkerTestState(
+    void* BindingContext,
+    uint16_t PartitionIndex,
+    uint32_t* IceOperationCount,
+    uint32_t* StatelessOperationCount,
+    uint64_t* IceOperationsQueued,
+    uint64_t* IceOperationsCompleted,
+    uint64_t* IceOperationsDropped);
 
 struct IceCallbackContext {
     std::atomic<uint32_t> BoundCount {0};
@@ -63,6 +76,11 @@ struct IceCallbackContext {
     std::atomic<QUIC_STATUS> UnboundPathStatus {QUIC_STATUS_ABORTED};
     HQUIC StopListenerOnBound {nullptr};
     bool BlockBound {false};
+    bool PostOnBound {false};
+    uint16_t BoundPostPartitionIndex {0};
+    const QUIC_ICE_OPERATION_V1* BoundOperation {nullptr};
+    std::atomic<bool>* BoundPostInCall {nullptr};
+    std::atomic<QUIC_STATUS> BoundPostStatus {QUIC_STATUS_ABORTED};
     enum class RxAction {
         Pass,
         Consumed,
@@ -99,6 +117,131 @@ struct IceCallbackContext {
     uint16_t LastReceivePartitionIndex {0};
     uint8_t LastReceiveTypeOfService {0};
 };
+
+struct IceOperationContext {
+    std::atomic<uint32_t> ExecuteCount {0};
+    std::atomic<uint32_t> CancelCount {0};
+    std::atomic<bool>* PostInCall {nullptr};
+    std::atomic<bool> ExecutedInline {false};
+    std::atomic<bool> BlockExecute {false};
+    CxPlatEvent ExecuteEntered;
+    CxPlatEvent AllowExecuteReturn;
+    CxPlatEvent Completed;
+};
+
+void
+QUIC_API
+IceOperationExecute(void* Context)
+{
+    auto* OperationContext = static_cast<IceOperationContext*>(Context);
+    if (OperationContext->PostInCall != nullptr &&
+        OperationContext->PostInCall->load(std::memory_order_acquire)) {
+        OperationContext->ExecutedInline.store(true, std::memory_order_release);
+    }
+    OperationContext->ExecuteCount.fetch_add(1, std::memory_order_relaxed);
+    OperationContext->ExecuteEntered.Set();
+    if (OperationContext->BlockExecute.load(std::memory_order_acquire)) {
+        OperationContext->AllowExecuteReturn.WaitForever();
+    }
+    OperationContext->Completed.Set();
+}
+
+void
+QUIC_API
+IceOperationCancel(void* Context)
+{
+    auto* OperationContext = static_cast<IceOperationContext*>(Context);
+    OperationContext->CancelCount.fetch_add(1, std::memory_order_relaxed);
+    OperationContext->Completed.Set();
+}
+
+QUIC_ICE_OPERATION_V1
+MakeIceOperation(IceOperationContext* Context)
+{
+    QUIC_ICE_OPERATION_V1 Operation {};
+    Operation.Size = sizeof(Operation);
+    Operation.Version = QUIC_ICE_DATAPATH_VERSION_1;
+    Operation.Context = Context;
+    Operation.Execute = IceOperationExecute;
+    Operation.Cancel = IceOperationCancel;
+    return Operation;
+}
+
+struct IceSequenceContext {
+    const QUIC_ICE_BINDING_API_V1* Binding {nullptr};
+    uint16_t PartitionIndex {0};
+    uint32_t Sequence {0};
+    CxPlatLock* OrderLock {nullptr};
+    std::vector<uint32_t>* Order {nullptr};
+    std::atomic<uint32_t>* ActiveDepth {nullptr};
+    std::atomic<uint32_t>* MaximumDepth {nullptr};
+    const QUIC_ICE_OPERATION_V1* ReentrantOperation {nullptr};
+    IceOperationContext* ReentrantContext {nullptr};
+    std::atomic<QUIC_STATUS> ReentrantStatus {QUIC_STATUS_ABORTED};
+    std::atomic<bool> ReentrantExecutedInline {false};
+    std::atomic<uint32_t> ExecuteCount {0};
+    std::atomic<uint32_t> CancelCount {0};
+    CxPlatEvent Completed;
+};
+
+void
+QUIC_API
+IceSequenceExecute(void* Context)
+{
+    auto* SequenceContext = static_cast<IceSequenceContext*>(Context);
+    const uint32_t Depth =
+        SequenceContext->ActiveDepth->fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+    uint32_t Maximum =
+        SequenceContext->MaximumDepth->load(std::memory_order_relaxed);
+    while (Maximum < Depth &&
+        !SequenceContext->MaximumDepth->compare_exchange_weak(
+            Maximum,
+            Depth,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+    }
+    {
+        LockGuard LockScope{*SequenceContext->OrderLock};
+        SequenceContext->Order->push_back(SequenceContext->Sequence);
+    }
+    if (SequenceContext->ReentrantOperation != nullptr) {
+        SequenceContext->ReentrantStatus.store(
+            SequenceContext->Binding->PostOperation(
+                SequenceContext->Binding->BindingContext,
+                SequenceContext->PartitionIndex,
+                SequenceContext->ReentrantOperation),
+            std::memory_order_release);
+        SequenceContext->ReentrantExecutedInline.store(
+            SequenceContext->ReentrantContext->ExecuteCount.load(
+                std::memory_order_acquire) != 0,
+            std::memory_order_release);
+    }
+    SequenceContext->ActiveDepth->fetch_sub(1, std::memory_order_acq_rel);
+    SequenceContext->ExecuteCount.fetch_add(1, std::memory_order_relaxed);
+    SequenceContext->Completed.Set();
+}
+
+void
+QUIC_API
+IceSequenceCancel(void* Context)
+{
+    auto* SequenceContext = static_cast<IceSequenceContext*>(Context);
+    SequenceContext->CancelCount.fetch_add(1, std::memory_order_relaxed);
+    SequenceContext->Completed.Set();
+}
+
+QUIC_ICE_OPERATION_V1
+MakeIceSequenceOperation(IceSequenceContext* Context)
+{
+    QUIC_ICE_OPERATION_V1 Operation {};
+    Operation.Size = sizeof(Operation);
+    Operation.Version = QUIC_ICE_DATAPATH_VERSION_1;
+    Operation.Context = Context;
+    Operation.Execute = IceSequenceExecute;
+    Operation.Cancel = IceSequenceCancel;
+    return Operation;
+}
 
 QUIC_ADDR
 MakeAlternateRemoteAddress(
@@ -335,6 +478,20 @@ IceBound(
         }
         CallbackContext->BoundControlStatus.store(
             Status, std::memory_order_release);
+    }
+    if (CallbackContext->PostOnBound) {
+        ASSERT_NE(nullptr, CallbackContext->BoundOperation);
+        ASSERT_NE(nullptr, CallbackContext->BoundPostInCall);
+        CallbackContext->BoundPostInCall->store(
+            true, std::memory_order_release);
+        CallbackContext->BoundPostStatus.store(
+            Binding->PostOperation(
+                Binding->BindingContext,
+                CallbackContext->BoundPostPartitionIndex,
+                CallbackContext->BoundOperation),
+            std::memory_order_release);
+        CallbackContext->BoundPostInCall->store(
+            false, std::memory_order_release);
     }
     CallbackContext->BoundEvent.Set();
     CallbackContext->BoundEntered.Set();
@@ -843,6 +1000,526 @@ TEST(IceDatapath, ConnectionConfigValidationAndStartedState)
     Connection.Close();
     ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
     EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, PostOperationValidatesAbiAndExecutesAsynchronously)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    const size_t RequiredApiSize =
+        FIELD_OFFSET(QUIC_ICE_BINDING_API_V1, PostOperation) +
+        sizeof(Context.Binding.PostOperation);
+    ASSERT_GE(Context.Binding.Size, RequiredApiSize);
+    ASSERT_NE(nullptr, Context.Binding.PostOperation);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(nullptr, 0, nullptr));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, nullptr));
+
+    IceOperationContext OperationContext;
+    std::atomic<bool> InPostCall {false};
+    OperationContext.PostInCall = &InPostCall;
+    auto Operation = MakeIceOperation(&OperationContext);
+
+    auto InvalidOperation = Operation;
+    InvalidOperation.Size--;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &InvalidOperation));
+    InvalidOperation = Operation;
+    InvalidOperation.Version++;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &InvalidOperation));
+    InvalidOperation = Operation;
+    InvalidOperation.Context = nullptr;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &InvalidOperation));
+    InvalidOperation = Operation;
+    InvalidOperation.Execute = nullptr;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &InvalidOperation));
+    InvalidOperation = Operation;
+    InvalidOperation.Cancel = nullptr;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &InvalidOperation));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, UINT16_MAX, &Operation));
+    if (CxPlatProcCount() > 1) {
+        EXPECT_EQ(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Context.Binding.PostOperation(
+                Context.Binding.BindingContext, 1, &Operation));
+    }
+    EXPECT_EQ(
+        0u, OperationContext.ExecuteCount.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        0u, OperationContext.CancelCount.load(std::memory_order_acquire));
+
+    InPostCall.store(true, std::memory_order_release);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &Operation));
+    InPostCall.store(false, std::memory_order_release);
+    ASSERT_TRUE(OperationContext.Completed.WaitTimeout(2000));
+    EXPECT_FALSE(
+        OperationContext.ExecutedInline.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        1u, OperationContext.ExecuteCount.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        0u, OperationContext.CancelCount.load(std::memory_order_acquire));
+    Connection.Close();
+}
+
+TEST(IceDatapath, BoundCallbackCanPostOperation)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    IceOperationContext OperationContext;
+    std::atomic<bool> InPostCall {false};
+    OperationContext.PostInCall = &InPostCall;
+    auto Operation = MakeIceOperation(&OperationContext);
+    Context.PostOnBound = true;
+    Context.BoundPostPartitionIndex = 0;
+    Context.BoundOperation = &Operation;
+    Context.BoundPostInCall = &InPostCall;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.BoundPostStatus.load(std::memory_order_acquire));
+    ASSERT_TRUE(OperationContext.Completed.WaitTimeout(2000));
+    EXPECT_FALSE(
+        OperationContext.ExecutedInline.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        1u, OperationContext.ExecuteCount.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        0u, OperationContext.CancelCount.load(std::memory_order_acquire));
+    Connection.Close();
+}
+
+TEST(IceDatapath, BlockingPostOperationDrainsBeforeUnbound)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    IceOperationContext OperationContext;
+    OperationContext.BlockExecute.store(true, std::memory_order_release);
+    auto Operation = MakeIceOperation(&OperationContext);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &Operation));
+    ASSERT_TRUE(OperationContext.ExecuteEntered.WaitTimeout(2000));
+
+    std::thread CloseThread([&]() { Connection.Close(); });
+    EXPECT_FALSE(Context.UnboundEvent.WaitTimeout(50));
+    OperationContext.AllowExecuteReturn.Set();
+    CloseThread.join();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, OperationContext.ExecuteCount.load(std::memory_order_acquire));
+    EXPECT_EQ(0u, OperationContext.CancelCount.load(std::memory_order_acquire));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_acquire));
+}
+
+TEST(IceDatapath, IceQueueLimitIsIndependentAndRecovers)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    IceOperationContext Blocker;
+    Blocker.BlockExecute.store(true, std::memory_order_release);
+    auto BlockerOperation = MakeIceOperation(&Blocker);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &BlockerOperation));
+    ASSERT_TRUE(Blocker.ExecuteEntered.WaitTimeout(2000));
+
+    uint32_t InitialIceCount = 0;
+    uint32_t InitialStatelessCount = 0;
+    uint64_t InitialQueued = 0;
+    uint64_t InitialCompleted = 0;
+    uint64_t InitialDropped = 0;
+    ASSERT_TRUE(
+        QuicBindingIceGetWorkerTestState(
+            Context.Binding.BindingContext,
+            0,
+            &InitialIceCount,
+            &InitialStatelessCount,
+            &InitialQueued,
+            &InitialCompleted,
+            &InitialDropped));
+    EXPECT_EQ(0u, InitialIceCount);
+
+    constexpr uint32_t AttemptCount = 512;
+    std::vector<std::unique_ptr<IceOperationContext>> OperationContexts;
+    OperationContexts.reserve(AttemptCount);
+    uint32_t Accepted = 0;
+    uint32_t Rejected = 0;
+    for (uint32_t Index = 0; Index < AttemptCount; ++Index) {
+        auto OperationContext = std::make_unique<IceOperationContext>();
+        auto Operation = MakeIceOperation(OperationContext.get());
+        const QUIC_STATUS Status =
+            Context.Binding.PostOperation(
+                Context.Binding.BindingContext, 0, &Operation);
+        if (Status == QUIC_STATUS_SUCCESS) {
+            ++Accepted;
+        } else {
+            EXPECT_EQ(QUIC_STATUS_OUT_OF_MEMORY, Status);
+            ++Rejected;
+        }
+        OperationContexts.push_back(std::move(OperationContext));
+    }
+    EXPECT_GT(Accepted, 0u);
+    EXPECT_GT(Rejected, 0u);
+
+    uint32_t IceCount = 0;
+    uint32_t StatelessCount = 0;
+    uint64_t Queued = 0;
+    uint64_t Completed = 0;
+    uint64_t Dropped = 0;
+    ASSERT_TRUE(
+        QuicBindingIceGetWorkerTestState(
+            Context.Binding.BindingContext,
+            0,
+            &IceCount,
+            &StatelessCount,
+            &Queued,
+            &Completed,
+            &Dropped));
+    EXPECT_EQ(Accepted, IceCount);
+    EXPECT_EQ(InitialStatelessCount, StatelessCount);
+    EXPECT_EQ(InitialQueued + Accepted, Queued);
+    EXPECT_EQ(InitialCompleted, Completed);
+    EXPECT_EQ(InitialDropped + Rejected, Dropped);
+
+    Blocker.AllowExecuteReturn.Set();
+    for (uint32_t Retry = 0; Retry != 4000; ++Retry) {
+        uint32_t CompletedCount = 0;
+        for (const auto& OperationContext : OperationContexts) {
+            CompletedCount +=
+                OperationContext->ExecuteCount.load(std::memory_order_acquire);
+        }
+        if (CompletedCount == Accepted) {
+            break;
+        }
+        CxPlatSleep(1);
+    }
+    uint32_t ExecuteCount = 0;
+    uint32_t CancelCount = 0;
+    for (const auto& OperationContext : OperationContexts) {
+        ExecuteCount +=
+            OperationContext->ExecuteCount.load(std::memory_order_acquire);
+        CancelCount +=
+            OperationContext->CancelCount.load(std::memory_order_acquire);
+    }
+    EXPECT_EQ(Accepted, ExecuteCount);
+    EXPECT_EQ(0u, CancelCount);
+
+    IceOperationContext Recovery;
+    auto RecoveryOperation = MakeIceOperation(&Recovery);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext, 0, &RecoveryOperation));
+    ASSERT_TRUE(Recovery.Completed.WaitTimeout(2000));
+    EXPECT_EQ(1u, Recovery.ExecuteCount.load(std::memory_order_acquire));
+    Connection.Close();
+}
+
+TEST(IceDatapath, PostOperationPreservesProducerFifoAndReentrantQueueing)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    CxPlatLock OrderLock;
+    std::vector<uint32_t> Order;
+    std::atomic<uint32_t> ActiveDepth {0};
+    std::atomic<uint32_t> MaximumDepth {0};
+    constexpr uint32_t OperationCount = 16;
+    std::array<IceSequenceContext, OperationCount> SequenceContexts;
+    std::array<QUIC_ICE_OPERATION_V1, OperationCount> Operations;
+    for (uint32_t Index = 0; Index < OperationCount; ++Index) {
+        SequenceContexts[Index].Binding = &Context.Binding;
+        SequenceContexts[Index].Sequence = Index;
+        SequenceContexts[Index].OrderLock = &OrderLock;
+        SequenceContexts[Index].Order = &Order;
+        SequenceContexts[Index].ActiveDepth = &ActiveDepth;
+        SequenceContexts[Index].MaximumDepth = &MaximumDepth;
+        Operations[Index] =
+            MakeIceSequenceOperation(&SequenceContexts[Index]);
+    }
+
+    IceOperationContext ReentrantContext;
+    auto ReentrantOperation = MakeIceOperation(&ReentrantContext);
+    SequenceContexts[0].ReentrantOperation = &ReentrantOperation;
+    SequenceContexts[0].ReentrantContext = &ReentrantContext;
+    for (uint32_t Index = 0; Index < OperationCount; ++Index) {
+        ASSERT_EQ(
+            QUIC_STATUS_SUCCESS,
+            Context.Binding.PostOperation(
+                Context.Binding.BindingContext, 0, &Operations[Index]));
+    }
+    for (auto& SequenceContext : SequenceContexts) {
+        ASSERT_TRUE(SequenceContext.Completed.WaitTimeout(2000));
+        EXPECT_EQ(
+            1u, SequenceContext.ExecuteCount.load(std::memory_order_acquire));
+        EXPECT_EQ(
+            0u, SequenceContext.CancelCount.load(std::memory_order_acquire));
+    }
+    ASSERT_TRUE(ReentrantContext.Completed.WaitTimeout(2000));
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        SequenceContexts[0].ReentrantStatus.load(std::memory_order_acquire));
+    EXPECT_FALSE(
+        SequenceContexts[0].ReentrantExecutedInline.load(
+            std::memory_order_acquire));
+    EXPECT_EQ(1u, MaximumDepth.load(std::memory_order_acquire));
+    ASSERT_EQ(OperationCount, Order.size());
+    for (uint32_t Index = 0; Index < OperationCount; ++Index) {
+        EXPECT_EQ(Index, Order[Index]);
+    }
+    Connection.Close();
+}
+
+TEST(IceDatapath, PostOperationMultipleProducersCompleteExactlyOnce)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(
+        Registration, 0, CleanUpManual);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    constexpr uint32_t ProducerCount = 4;
+    constexpr uint32_t OperationsPerProducer = 32;
+    constexpr uint32_t OperationCount =
+        ProducerCount * OperationsPerProducer;
+    std::array<IceOperationContext, OperationCount> OperationContexts;
+    std::array<QUIC_ICE_OPERATION_V1, OperationCount> Operations;
+    std::array<std::atomic<QUIC_STATUS>, OperationCount> Statuses;
+    for (uint32_t Index = 0; Index < OperationCount; ++Index) {
+        Operations[Index] = MakeIceOperation(&OperationContexts[Index]);
+        Statuses[Index].store(
+            QUIC_STATUS_ABORTED, std::memory_order_relaxed);
+    }
+    std::array<std::thread, ProducerCount> Producers;
+    for (uint32_t Producer = 0; Producer < ProducerCount; ++Producer) {
+        Producers[Producer] = std::thread([&, Producer]() {
+            const uint32_t Start = Producer * OperationsPerProducer;
+            for (uint32_t Offset = 0;
+                 Offset < OperationsPerProducer;
+                 ++Offset) {
+                const uint32_t Index = Start + Offset;
+                Statuses[Index].store(
+                    Context.Binding.PostOperation(
+                        Context.Binding.BindingContext,
+                        0,
+                        &Operations[Index]),
+                    std::memory_order_release);
+            }
+        });
+    }
+    for (auto& Producer : Producers) {
+        Producer.join();
+    }
+    for (uint32_t Index = 0; Index < OperationCount; ++Index) {
+        ASSERT_EQ(
+            QUIC_STATUS_SUCCESS,
+            Statuses[Index].load(std::memory_order_acquire));
+        ASSERT_TRUE(OperationContexts[Index].Completed.WaitTimeout(2000));
+        EXPECT_EQ(
+            1u,
+            OperationContexts[Index].ExecuteCount.load(
+                std::memory_order_acquire));
+        EXPECT_EQ(
+            0u,
+            OperationContexts[Index].CancelCount.load(
+                std::memory_order_acquire));
+    }
+    Connection.Close();
+}
+
+TEST(IceDatapath, PostOperationSerializesWithSamePartitionReceive)
+{
+    const std::array<QUIC_EXECUTION_PROFILE, 2> Profiles = {
+        QUIC_EXECUTION_PROFILE_LOW_LATENCY,
+        QUIC_EXECUTION_PROFILE_TYPE_MAX_THROUGHPUT};
+    const std::array<uint8_t, 20> Stun = {
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x02};
+
+    for (const auto Profile : Profiles) {
+        MsQuicRegistration Registration("IcePostAffinity", Profile, true);
+        ASSERT_TRUE(Registration.IsValid());
+        IceCallbackContext Context;
+        Context.Action.store(
+            IceCallbackContext::RxAction::Consumed,
+            std::memory_order_release);
+        Context.BlockReceive.store(true, std::memory_order_release);
+        auto Config = MakeIceConfig(&Context);
+        MsQuicConnection Connection(
+            Registration, 0, CleanUpManual);
+        ASSERT_TRUE(Connection.IsValid());
+        ASSERT_EQ(
+            QUIC_STATUS_SUCCESS,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG,
+                sizeof(Config),
+                &Config));
+
+        SendIceDatagram(
+            Context.LocalAddress,
+            Stun.data(),
+            (uint16_t)Stun.size());
+        ASSERT_TRUE(Context.ReceiveEntered.WaitTimeout(2000));
+
+        IceOperationContext OperationContext;
+        auto Operation = MakeIceOperation(&OperationContext);
+        ASSERT_EQ(
+            QUIC_STATUS_SUCCESS,
+            Context.Binding.PostOperation(
+                Context.Binding.BindingContext, 0, &Operation));
+        EXPECT_FALSE(OperationContext.Completed.WaitTimeout(50));
+        Context.AllowReceiveReturn.Set();
+        ASSERT_TRUE(OperationContext.Completed.WaitTimeout(2000));
+        EXPECT_EQ(
+            1u,
+            OperationContext.ExecuteCount.load(std::memory_order_acquire));
+        EXPECT_EQ(
+            0u,
+            OperationContext.CancelCount.load(std::memory_order_acquire));
+        Connection.Close();
+    }
+}
+
+TEST(IceDatapath, SharedBindingPartitionsRunIndependently)
+{
+    if (CxPlatProcCount() < 2) {
+        GTEST_SKIP() << "single worker partition";
+    }
+
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG,
+            sizeof(Config),
+            &Config));
+    MsQuicAlpn Alpn("IcePostPartitions");
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn));
+
+    IceOperationContext PartitionZeroBlocker;
+    PartitionZeroBlocker.BlockExecute.store(
+        true, std::memory_order_release);
+    auto PartitionZeroBlockerOperation =
+        MakeIceOperation(&PartitionZeroBlocker);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext,
+            0,
+            &PartitionZeroBlockerOperation));
+    ASSERT_TRUE(PartitionZeroBlocker.ExecuteEntered.WaitTimeout(2000));
+
+    IceOperationContext PartitionZeroQueued;
+    auto PartitionZeroQueuedOperation =
+        MakeIceOperation(&PartitionZeroQueued);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext,
+            0,
+            &PartitionZeroQueuedOperation));
+    IceOperationContext PartitionOne;
+    auto PartitionOneOperation = MakeIceOperation(&PartitionOne);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.PostOperation(
+            Context.Binding.BindingContext,
+            1,
+            &PartitionOneOperation));
+
+    ASSERT_TRUE(PartitionOne.Completed.WaitTimeout(2000));
+    EXPECT_FALSE(PartitionZeroQueued.Completed.WaitTimeout(50));
+    PartitionZeroBlocker.AllowExecuteReturn.Set();
+    ASSERT_TRUE(PartitionZeroQueued.Completed.WaitTimeout(2000));
+    EXPECT_EQ(
+        1u, PartitionOne.ExecuteCount.load(std::memory_order_acquire));
+    EXPECT_EQ(
+        1u, PartitionZeroQueued.ExecuteCount.load(std::memory_order_acquire));
+    Listener.Close();
 }
 
 TEST(IceDatapath, SelectedPathAppliesRelayMtuCapOnly)

@@ -62,3 +62,44 @@ QuicBindingIceGetTestState(
             (int64_t*)&Binding->Stats.Recv.ExtensionDrop, 0, 0);
     return TRUE;
 }
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicBindingIceGetWorkerTestState(
+    _In_ void* BindingContext,
+    _In_ uint16_t PartitionIndex,
+    _Out_ uint32_t* IceOperationCount,
+    _Out_ uint32_t* StatelessOperationCount,
+    _Out_ uint64_t* IceOperationsQueued,
+    _Out_ uint64_t* IceOperationsCompleted,
+    _Out_ uint64_t* IceOperationsDropped
+    )
+{
+    if (BindingContext == NULL || IceOperationCount == NULL ||
+        StatelessOperationCount == NULL || IceOperationsQueued == NULL ||
+        IceOperationsCompleted == NULL || IceOperationsDropped == NULL) {
+        return FALSE;
+    }
+
+    QUIC_BINDING* Binding = (QUIC_BINDING*)BindingContext;
+    QUIC_WORKER_POOL* WorkerPool = Binding->IceExtension.WorkerPool;
+    if (WorkerPool == NULL || PartitionIndex >= WorkerPool->WorkerCount) {
+        return FALSE;
+    }
+    QUIC_WORKER* Worker =
+        &WorkerPool->Workers[PartitionIndex];
+    CxPlatDispatchLockAcquire(&Worker->Lock);
+    *IceOperationCount = Worker->IceOperationCount;
+    *StatelessOperationCount = Worker->OperationCount;
+    CxPlatDispatchLockRelease(&Worker->Lock);
+    *IceOperationsQueued =
+        (uint64_t)InterlockedCompareExchange64(
+            (int64_t*)&Worker->IceOperationsQueued, 0, 0);
+    *IceOperationsCompleted =
+        (uint64_t)InterlockedCompareExchange64(
+            (int64_t*)&Worker->IceOperationsCompleted, 0, 0);
+    *IceOperationsDropped =
+        (uint64_t)InterlockedCompareExchange64(
+            (int64_t*)&Worker->IceOperationsDropped, 0, 0);
+    return TRUE;
+}

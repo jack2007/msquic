@@ -7,12 +7,14 @@
 
 typedef struct QUIC_PARTITIONED_HASHTABLE QUIC_PARTITIONED_HASHTABLE;
 typedef struct QUIC_STATELESS_CONTEXT QUIC_STATELESS_CONTEXT;
+typedef struct QUIC_WORKER_POOL QUIC_WORKER_POOL;
 
 #include "msquic_ice.h"
 
 typedef struct QUIC_ICE_EXTENSION {
     QUIC_ICE_DATAPATH_CONFIG_V1 Config;
     QUIC_ICE_BINDING_API_V1 BindingApi;
+    QUIC_WORKER_POOL* WorkerPool;
     CXPLAT_RUNDOWN_REF UpcallRundown;
     volatile long PathType;
     volatile long Closing;

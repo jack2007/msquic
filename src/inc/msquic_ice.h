@@ -50,6 +50,16 @@ typedef struct QUIC_ICE_RX_OUTPUT_V1 {
     QUIC_ADDR InnerRemoteAddress;
 } QUIC_ICE_RX_OUTPUT_V1;
 
+typedef void (QUIC_API *QUIC_ICE_OPERATION_CALLBACK)(void* Context);
+
+typedef struct QUIC_ICE_OPERATION_V1 {
+    uint32_t Size;
+    uint32_t Version;
+    void* Context;
+    QUIC_ICE_OPERATION_CALLBACK Execute;
+    QUIC_ICE_OPERATION_CALLBACK Cancel;
+} QUIC_ICE_OPERATION_V1;
+
 typedef struct QUIC_ICE_BINDING_API_V1 {
     uint32_t Size;
     uint32_t Version;
@@ -63,6 +73,10 @@ typedef struct QUIC_ICE_BINDING_API_V1 {
     QUIC_STATUS (QUIC_API *SetSelectedPath)(
         void* BindingContext,
         QUIC_ICE_PATH_TYPE PathType);
+    QUIC_STATUS (QUIC_API *PostOperation)(
+        void* BindingContext,
+        uint16_t PartitionIndex,
+        const QUIC_ICE_OPERATION_V1* Operation);
 } QUIC_ICE_BINDING_API_V1;
 
 typedef struct QUIC_ICE_DATAPATH_CONFIG_V1 {

@@ -609,6 +609,16 @@ QuicLibraryOnListenerRegistered(
     );
 
 //
+// Ensures the internal/stateless registration exists. This is a PASSIVE-only
+// operation because it may allocate and create worker execution contexts.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryEnsureStatelessRegistration(
+    void
+    );
+
+//
 // Returns the next available worker. Note, the worker may be overloaded.
 //
 _IRQL_requires_max_(DISPATCH_LEVEL)

@@ -11,6 +11,8 @@
 
 typedef struct QUIC_SEND_REQUEST QUIC_SEND_REQUEST;
 
+#include "msquic_ice.h"
+
 //
 // For logging.
 //
@@ -39,6 +41,9 @@ typedef enum QUIC_OPERATION_TYPE {
     QUIC_OPER_TYPE_VERSION_NEGOTIATION, // A version negotiation needs to be sent.
     QUIC_OPER_TYPE_STATELESS_RESET,     // A stateless reset needs to be sent.
     QUIC_OPER_TYPE_RETRY,               // A retry needs to be sent.
+
+    // Private ICE host callback queued on the internal partition worker.
+    QUIC_OPER_TYPE_ICE,
 
 } QUIC_OPERATION_TYPE;
 
@@ -262,6 +267,13 @@ typedef struct QUIC_OPERATION {
             QUIC_STATELESS_CONTEXT* Context;
         } STATELESS; // Stateless reset, retry and VN
         struct {
+            QUIC_BINDING* Binding;
+            QUIC_ICE_OPERATION_V1 Operation;
+            BOOLEAN OwnsContext : 1;
+            BOOLEAN HasRundown : 1;
+            BOOLEAN HasBindingRef : 1;
+        } ICE;
+        struct {
             uint8_t PhysicalAddress[6];
             uint8_t PathId;
             BOOLEAN Succeeded;
@@ -269,6 +281,18 @@ typedef struct QUIC_OPERATION {
     };
 
 } QUIC_OPERATION;
+
+QUIC_INLINE
+BOOLEAN
+QuicOperationIsStateless(
+    _In_ QUIC_OPERATION_TYPE Type
+    )
+{
+    return
+        Type == QUIC_OPER_TYPE_VERSION_NEGOTIATION ||
+        Type == QUIC_OPER_TYPE_STATELESS_RESET ||
+        Type == QUIC_OPER_TYPE_RETRY;
+}
 
 QUIC_INLINE
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -358,6 +382,18 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 void
 QuicOperationFree(
     _In_ QUIC_OPERATION* Oper
+    );
+
+//
+// Completes an ICE operation outside all worker/binding locks. Execute and
+// Cancel are mutually exclusive; either path releases rundown before the
+// binding reference.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicOperationCompleteIce(
+    _In_ QUIC_OPERATION* Oper,
+    _In_ BOOLEAN Execute
     );
 
 //

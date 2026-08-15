@@ -6,6 +6,7 @@ set(SOURCES
     BbrTest.cpp
     CubicTest.cpp
     FrameTest.cpp
+    IceOperationTest.cpp
     PacketNumberTest.cpp
     PartitionTest.cpp
     RangeTest.cpp

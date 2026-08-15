@@ -2675,9 +2675,18 @@ QuicLibraryOnListenerRegistered(
     _In_ QUIC_LISTENER* Listener
     )
 {
-    BOOLEAN Success = TRUE;
-
     UNREFERENCED_PARAMETER(Listener);
+
+    return QUIC_SUCCEEDED(QuicLibraryEnsureStatelessRegistration());
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryEnsureStatelessRegistration(
+    void
+    )
+{
+    QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
 
     CxPlatLockAcquire(&MsQuicLib.Lock);
 
@@ -2694,20 +2703,14 @@ QuicLibraryOnListenerRegistered(
             QUIC_EXECUTION_PROFILE_TYPE_INTERNAL
         };
 
-        if (QUIC_FAILED(
+        Status =
             MsQuicRegistrationOpen(
                 &Config,
-                (HQUIC*)&MsQuicLib.StatelessRegistration))) {
-            Success = FALSE;
-            goto Fail;
-        }
+                (HQUIC*)&MsQuicLib.StatelessRegistration);
     }
 
-Fail:
-
     CxPlatLockRelease(&MsQuicLib.Lock);
-
-    return Success;
+    return Status;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
