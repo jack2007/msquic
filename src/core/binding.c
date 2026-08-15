@@ -295,6 +295,23 @@ QuicIceDatapathConfigIsValid(
         Config->Unbound != NULL;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+long
+QuicBindingIceAtomicLoadAcquire(
+    _In_ volatile long* Value
+    )
+{
+#if defined(_WIN32) || defined(_KERNEL_MODE)
+    // ReadAcquire is a type-correct 32-bit acquire load on every Windows
+    // architecture, including ARM64. Unlike an interlocked compare/exchange,
+    // it does not add a locked RMW to the legacy receive hot path.
+    return ReadAcquire(Value);
+#else
+    return __atomic_load_n(Value, __ATOMIC_ACQUIRE);
+#endif
+}
+
 static
 BOOLEAN
 QuicBindingIceConfigIsCompatible(
@@ -402,7 +419,7 @@ QuicBindingIceSendControl(
     }
 
     QUIC_STATUS Status =
-        Binding->IceExtension.Closing ||
+        QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing) ||
         !Binding->IceExtension.Configured ?
             QUIC_STATUS_INVALID_STATE : QUIC_STATUS_NOT_SUPPORTED;
 
@@ -430,7 +447,8 @@ QuicBindingIceSetSelectedPath(
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    if (Binding->IceExtension.Closing || !Binding->IceExtension.Configured) {
+    if (QuicBindingIceAtomicLoadAcquire(&Binding->IceExtension.Closing) ||
+        !Binding->IceExtension.Configured) {
         CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
         return QUIC_STATUS_INVALID_STATE;
     }
@@ -2015,11 +2033,7 @@ QuicBindingIceBoundIsPublished(
     _In_ volatile long* Bound
     )
 {
-#if defined(_WIN32) || defined(_KERNEL_MODE)
-    return ReadNoFence(Bound) != FALSE;
-#else
-    return __atomic_load_n(Bound, __ATOMIC_RELAXED) != FALSE;
-#endif
+    return QuicBindingIceAtomicLoadAcquire(Bound) != FALSE;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2129,7 +2143,9 @@ QuicBindingReceive(
             // Bound is the release-published install gate. Recheck it after
             // entering rundown so an installing/unbinding extension is never
             // called with a half-published context.
-            const BOOLEAN ExtensionClosing = Binding->IceExtension.Closing;
+            const BOOLEAN ExtensionClosing =
+                QuicBindingIceAtomicLoadAcquire(
+                    &Binding->IceExtension.Closing) != FALSE;
             if (!QuicBindingIceBoundIsPublished(&Binding->IceExtension.Bound) ||
                 ExtensionClosing) {
                 CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
@@ -2184,7 +2200,9 @@ QuicBindingReceive(
 
                     Datagram->Buffer = (uint8_t*)Output.InnerBuffer;
                     Datagram->BufferLength = (uint16_t)Output.InnerBufferLength;
-                    Datagram->Route->RemoteAddress = Output.InnerRemoteAddress;
+                    Packet->IceRoute = *Datagram->Route;
+                    Packet->IceRoute.RemoteAddress = Output.InnerRemoteAddress;
+                    Datagram->Route = &Packet->IceRoute;
                     Packet->AvailBuffer = Output.InnerBuffer;
                     Packet->AvailBufferLength = (uint16_t)Output.InnerBufferLength;
                     InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.RelayInner);

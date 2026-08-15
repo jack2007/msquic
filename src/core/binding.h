@@ -60,6 +60,16 @@ typedef struct QUIC_RX_PACKET {
     uint64_t PacketId;
 
     //
+    // REINJECT_QUIC may replace the peer address for this packet. Receive
+    // batching/GRO can make several CXPLAT_RECV_DATA entries share one
+    // datapath route, so keep any replacement route in the packet's existing
+    // client receive context instead of mutating the shared route. This must
+    // precede PacketNumber because preprocess clears fields from PacketNumber
+    // onward.
+    //
+    CXPLAT_ROUTE IceRoute;
+
+    //
     // The bytes that represent the fully decoded packet number.
     //
     uint64_t PacketNumber;

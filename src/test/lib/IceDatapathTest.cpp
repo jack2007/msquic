@@ -15,6 +15,9 @@
 #include <array>
 #include <cstdint>
 #include <thread>
+#ifdef __linux__
+#include <netinet/udp.h>
+#endif
 
 namespace {
 
@@ -41,7 +44,9 @@ struct IceCallbackContext {
         EmptyInnerBuffer,
         WildcardRemote,
         ZeroPortRemote,
-        UnknownDisposition
+        UnknownDisposition,
+        ReinjectFullAlternateRemote,
+        ReinjectFirstThenPass
     };
     std::atomic<RxAction> Action {RxAction::Pass};
     std::atomic<uint32_t> ReceiveCount {0};
@@ -54,9 +59,23 @@ struct IceCallbackContext {
     std::array<uint8_t, 24> LastReceiveBytes {};
     QUIC_ADDR LastReceiveLocalAddress {};
     QUIC_ADDR LastReceiveRemoteAddress {};
+    QUIC_ADDR LastInnerRemoteAddress {};
+    std::array<QUIC_ADDR, 2> ReceiveRemoteAddresses {};
     uint16_t LastReceivePartitionIndex {0};
     uint8_t LastReceiveTypeOfService {0};
 };
+
+QUIC_ADDR
+MakeAlternateRemoteAddress(
+    const QUIC_ADDR& OuterAddress)
+{
+    QUIC_ADDR AlternateAddress = OuterAddress;
+    const uint16_t OuterPort = QuicAddrGetPort(&OuterAddress);
+    QuicAddrSetPort(
+        &AlternateAddress,
+        OuterPort == UINT16_MAX ? OuterPort - 1 : OuterPort + 1);
+    return AlternateAddress;
+}
 
 QUIC_ICE_RX_DISPOSITION
 QUIC_API
@@ -66,6 +85,8 @@ IceReceive(
     QUIC_ICE_RX_OUTPUT_V1* Output)
 {
     auto* CallbackContext = static_cast<IceCallbackContext*>(Context);
+    const uint32_t ReceiveIndex =
+        CallbackContext->ReceiveCount.fetch_add(1, std::memory_order_relaxed);
     struct ReceiveEventGuard {
         CxPlatEvent& Event;
         ~ReceiveEventGuard() { Event.Set(); }
@@ -80,10 +101,12 @@ IceReceive(
                 Input->BufferLength : (uint32_t)CallbackContext->LastReceiveBytes.size());
         CallbackContext->LastReceiveLocalAddress = Input->LocalAddress;
         CallbackContext->LastReceiveRemoteAddress = Input->RemoteAddress;
+        if (ReceiveIndex < CallbackContext->ReceiveRemoteAddresses.size()) {
+            CallbackContext->ReceiveRemoteAddresses[ReceiveIndex] = Input->RemoteAddress;
+        }
         CallbackContext->LastReceivePartitionIndex = Input->PartitionIndex;
         CallbackContext->LastReceiveTypeOfService = Input->TypeOfService;
     }
-    CallbackContext->ReceiveCount.fetch_add(1, std::memory_order_relaxed);
     *Output = {};
 
     const auto Action = CallbackContext->Action.load(std::memory_order_acquire);
@@ -102,7 +125,12 @@ IceReceive(
         Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
         Output->InnerBuffer = Input->Buffer + 4;
         Output->InnerBufferLength = Input->BufferLength - 4;
-        Output->InnerRemoteAddress = Input->RemoteAddress;
+        Output->InnerRemoteAddress =
+            MakeAlternateRemoteAddress(Input->RemoteAddress);
+        {
+            LockGuard LockScope{CallbackContext->ReceiveLock};
+            CallbackContext->LastInnerRemoteAddress = Output->InnerRemoteAddress;
+        }
         return QUIC_ICE_RX_REINJECT_QUIC;
     case IceCallbackContext::RxAction::MismatchedDisposition:
         Output->Disposition = QUIC_ICE_RX_CONSUMED;
@@ -153,6 +181,32 @@ IceReceive(
     case IceCallbackContext::RxAction::UnknownDisposition:
         Output->Disposition = (QUIC_ICE_RX_DISPOSITION)99;
         return (QUIC_ICE_RX_DISPOSITION)99;
+    case IceCallbackContext::RxAction::ReinjectFullAlternateRemote:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer;
+        Output->InnerBufferLength = Input->BufferLength;
+        Output->InnerRemoteAddress =
+            MakeAlternateRemoteAddress(Input->RemoteAddress);
+        {
+            LockGuard LockScope{CallbackContext->ReceiveLock};
+            CallbackContext->LastInnerRemoteAddress = Output->InnerRemoteAddress;
+        }
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::ReinjectFirstThenPass:
+        if (ReceiveIndex != 0) {
+            Output->Disposition = QUIC_ICE_RX_PASS;
+            return QUIC_ICE_RX_PASS;
+        }
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + 4;
+        Output->InnerBufferLength = Input->BufferLength - 4;
+        Output->InnerRemoteAddress =
+            MakeAlternateRemoteAddress(Input->RemoteAddress);
+        {
+            LockGuard LockScope{CallbackContext->ReceiveLock};
+            CallbackContext->LastInnerRemoteAddress = Output->InnerRemoteAddress;
+        }
+        return QUIC_ICE_RX_REINJECT_QUIC;
     }
 
     return QUIC_ICE_RX_PASS;
@@ -220,6 +274,33 @@ IceListenerCallback(
     QUIC_LISTENER_EVENT*)
 {
     return QUIC_STATUS_SUCCESS;
+}
+
+struct IceAttributionContext {
+    CxPlatEvent NewConnectionEvent;
+    CxPlatLock Lock;
+    QUIC_ADDR RemoteAddress {};
+};
+
+QUIC_STATUS
+QUIC_API
+IceAttributionListenerCallback(
+    MsQuicListener*,
+    void* Context,
+    QUIC_LISTENER_EVENT* Event)
+{
+    if (Event->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) {
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    auto* AttributionContext = static_cast<IceAttributionContext*>(Context);
+    {
+        LockGuard LockScope{AttributionContext->Lock};
+        AttributionContext->RemoteAddress =
+            *Event->NEW_CONNECTION.Info->RemoteAddress;
+    }
+    AttributionContext->NewConnectionEvent.Set();
+    return QUIC_STATUS_CONNECTION_REFUSED;
 }
 
 void
@@ -362,6 +443,78 @@ WaitForListenerDroppedPackets(
     }
     return false;
 }
+
+bool
+WaitForReceiveCount(
+    const IceCallbackContext& Context,
+    uint32_t Expected)
+{
+    for (uint32_t Attempt = 0; Attempt < 2000; ++Attempt) {
+        if (Context.ReceiveCount.load(std::memory_order_acquire) >= Expected) {
+            return true;
+        }
+        CxPlatSleep(1);
+    }
+    return false;
+}
+
+#if defined(__linux__) && defined(UDP_SEGMENT)
+bool
+SendIceSegmentedDatagrams(
+    const QUIC_ADDR& RemoteAddress,
+    const uint8_t* Buffer,
+    uint16_t BufferLength,
+    uint16_t SegmentLength,
+    QUIC_ADDR& LocalAddress)
+{
+    int Socket = socket(RemoteAddress.Ip.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (Socket < 0) {
+        return false;
+    }
+
+    sockaddr_in NativeLocalAddress = {};
+    NativeLocalAddress.sin_family = AF_INET;
+    NativeLocalAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(
+            Socket,
+            reinterpret_cast<const sockaddr*>(&NativeLocalAddress),
+            sizeof(NativeLocalAddress)) != 0) {
+        close(Socket);
+        return false;
+    }
+
+    socklen_t NativeLocalAddressLength = sizeof(NativeLocalAddress);
+    const int SegmentSize = SegmentLength;
+    if (getsockname(
+            Socket,
+            reinterpret_cast<sockaddr*>(&NativeLocalAddress),
+            &NativeLocalAddressLength) != 0 ||
+        setsockopt(
+            Socket,
+            SOL_UDP,
+            UDP_SEGMENT,
+            &SegmentSize,
+            sizeof(SegmentSize)) != 0) {
+        close(Socket);
+        return false;
+    }
+
+    CxPlatCopyMemory(
+        &LocalAddress.Ipv4,
+        &NativeLocalAddress,
+        sizeof(NativeLocalAddress));
+    const int Sent =
+        sendto(
+            Socket,
+            reinterpret_cast<const char*>(Buffer),
+            BufferLength,
+            0,
+            &RemoteAddress.Ip,
+            sizeof(sockaddr_in));
+    close(Socket);
+    return Sent == BufferLength;
+}
+#endif
 
 } // namespace
 
@@ -882,7 +1035,6 @@ TEST(IceDatapath, ReceiveDemuxPassConsumedAndReinject)
         0x00, 0x00, 0x00, 0x02};
     Context.Action.store(IceCallbackContext::RxAction::Consumed, std::memory_order_release);
     SendIceDatagramAndWait(Context, LocalAddress.SockAddr, Stun.data(), Stun.size());
-    ASSERT_TRUE(WaitForListenerDroppedPackets(Listener, InitialDroppedPackets));
 
     const std::array<uint8_t, 1> Quic = {0xC0};
     Context.Action.store(IceCallbackContext::RxAction::Pass, std::memory_order_release);
@@ -895,7 +1047,152 @@ TEST(IceDatapath, ReceiveDemuxPassConsumedAndReinject)
     SendIceDatagramAndWait(
         Context, LocalAddress.SockAddr, ChannelData.data(), ChannelData.size());
     EXPECT_TRUE(WaitForListenerDroppedPackets(Listener, InitialDroppedPackets + 2));
+    {
+        LockGuard LockScope{Context.ReceiveLock};
+        EXPECT_FALSE(QuicAddrCompare(
+            &Context.LastReceiveRemoteAddress,
+            &Context.LastInnerRemoteAddress));
+    }
     EXPECT_EQ(3u, Context.ReceiveCount.load(std::memory_order_relaxed));
+    Listener.Close();
+}
+
+TEST(IceDatapath, ReinjectDoesNotPolluteSharedGroRoute)
+{
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    MsQuicAlpn Alpn("IceSharedGroRoute");
+    QuicAddr ListenerAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    ListenerAddress.SetPort(0);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.Start(Alpn, &ListenerAddress.SockAddr));
+    uint32_t ListenerAddressLength = sizeof(ListenerAddress.SockAddr);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        MsQuic->GetParam(
+            Listener.Handle,
+            QUIC_PARAM_LISTENER_LOCAL_ADDRESS,
+            &ListenerAddressLength,
+            &ListenerAddress.SockAddr));
+    const uint64_t InitialDroppedPackets = GetListenerDroppedPackets(Listener);
+
+    // UDP_SEGMENT plus the listener's UDP_GRO option creates two recv-data
+    // entries backed by one I/O block and therefore one outer route.
+    const std::array<uint8_t, 10> Segments = {
+        0x40, 0x01, 0x00, 0x01, 0xC0,
+        0x40, 0x02, 0x00, 0x01, 0xC0};
+    Context.Action.store(
+        IceCallbackContext::RxAction::ReinjectFirstThenPass,
+        std::memory_order_release);
+    QUIC_ADDR SenderAddress = {};
+    if (!SendIceSegmentedDatagrams(
+            ListenerAddress.SockAddr,
+            Segments.data(),
+            Segments.size(),
+            5,
+            SenderAddress)) {
+        Listener.Close();
+        GTEST_SKIP() << "UDP segmentation is unavailable";
+    }
+
+    ASSERT_TRUE(WaitForReceiveCount(Context, 2));
+    ASSERT_TRUE(WaitForListenerDroppedPackets(
+        Listener, InitialDroppedPackets + 2));
+    {
+        LockGuard LockScope{Context.ReceiveLock};
+        ASSERT_FALSE(QuicAddrCompare(
+            &SenderAddress, &Context.LastInnerRemoteAddress));
+        EXPECT_TRUE(QuicAddrCompare(
+            &SenderAddress, &Context.ReceiveRemoteAddresses[0]));
+        EXPECT_TRUE(QuicAddrCompare(
+            &SenderAddress, &Context.ReceiveRemoteAddresses[1]));
+    }
+    Listener.Close();
+#else
+    GTEST_SKIP() << "UDP segmentation is unavailable";
+#endif
+}
+
+TEST(IceDatapath, ReinjectRemoteSelectsPublicConnectionPeer)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext IceContext;
+    IceAttributionContext AttributionContext;
+    auto IceConfig = MakeIceConfig(&IceContext);
+    MsQuicListener Listener(
+        Registration,
+        CleanUpManual,
+        IceAttributionListenerCallback,
+        &AttributionContext);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG,
+            sizeof(IceConfig),
+            &IceConfig));
+
+    MsQuicAlpn Alpn("IcePeerAttribution");
+    QuicAddr ListenerAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    ListenerAddress.SetPort(0);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.Start(Alpn, &ListenerAddress.SockAddr));
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.GetLocalAddr(ListenerAddress));
+
+    IceContext.Action.store(
+        IceCallbackContext::RxAction::ReinjectFullAlternateRemote,
+        std::memory_order_release);
+    MsQuicCredentialConfig ClientCredential;
+    MsQuicConfiguration ClientConfiguration(
+        Registration, Alpn, ClientCredential);
+    ASSERT_TRUE(ClientConfiguration.IsValid());
+    MsQuicConnection Client(Registration);
+    ASSERT_TRUE(Client.IsValid());
+    ASSERT_TRUE(QUIC_SUCCEEDED(Client.Start(
+        ClientConfiguration,
+        QUIC_ADDRESS_FAMILY_INET,
+        "127.0.0.1",
+        ListenerAddress.GetPort())));
+
+    const bool NewConnection =
+        AttributionContext.NewConnectionEvent.WaitTimeout(2000);
+    if (!NewConnection) {
+        ADD_FAILURE() << "new connection not attributed; receive count="
+                      << IceContext.ReceiveCount.load(std::memory_order_acquire)
+                      << " dropped=" << GetListenerDroppedPackets(Listener);
+        Client.Close();
+        Listener.Close();
+        return;
+    }
+    ASSERT_TRUE(WaitForReceiveCount(IceContext, 1));
+    {
+        LockGuard IceLock{IceContext.ReceiveLock};
+        LockGuard AttributionLock{AttributionContext.Lock};
+        EXPECT_FALSE(QuicAddrCompare(
+            &IceContext.ReceiveRemoteAddresses[0],
+            &IceContext.LastInnerRemoteAddress));
+        EXPECT_TRUE(QuicAddrCompare(
+            &IceContext.LastInnerRemoteAddress,
+            &AttributionContext.RemoteAddress));
+    }
+
+    Client.Close();
     Listener.Close();
 }
 
