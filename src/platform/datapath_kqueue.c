@@ -439,7 +439,6 @@ CxPlatDataPathInitialize(
     )
 {
     UNREFERENCED_PARAMETER(TcpCallbacks);
-    UNREFERENCED_PARAMETER(InitConfig);
 
     if (NewDataPath == NULL) {
         return QUIC_STATUS_INVALID_PARAMETER;
@@ -474,6 +473,12 @@ CxPlatDataPathInitialize(
     Datapath->WorkerPool = WorkerPool;
     Datapath->PartitionCount = 1; //CxPlatWorkerPoolGetCount(WorkerPool); // Darwin only supports a single receiver
     CxPlatRefInitializeEx(&Datapath->RefCount, Datapath->PartitionCount);
+    // kqueue currently never advertises UDP send segmentation, but explicitly
+    // honor the init contract so the option remains consistent across all
+    // user-mode datapaths if feature discovery changes later.
+    if (InitConfig->DisableSendSegmentation) {
+        Datapath->Features &= ~CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION;
+    }
 
     for (uint32_t i = 0; i < Datapath->PartitionCount; i++) {
         CxPlatProcessorContextInitialize(

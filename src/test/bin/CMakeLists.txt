@@ -4,6 +4,7 @@
 set(SOURCES
     quic_gtest.cpp
     quic_gtest.h
+    ${PROJECT_SOURCE_DIR}/src/core/binding_test.c
 )
 
 if (WIN32)

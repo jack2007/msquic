@@ -5,8 +5,6 @@
 
 --*/
 
-#include "../../core/precomp.h"
-#undef QUIC_API_ENABLE_PREVIEW_FEATURES
 #include "precomp.h"
 #undef min
 #undef max
@@ -22,6 +20,14 @@
 #endif
 
 namespace {
+
+extern "C"
+BOOLEAN
+QuicBindingIceGetTestState(
+    void* BindingContext,
+    uint16_t* LocalMtu,
+    uint64_t* SendExtensionDrops,
+    uint64_t* RecvExtensionDrops);
 
 struct IceCallbackContext {
     std::atomic<uint32_t> BoundCount {0};
@@ -385,27 +391,16 @@ uint16_t
 GetIceBindingLocalMtu(
     const IceCallbackContext& Context)
 {
-    auto* Binding =
-        static_cast<QUIC_BINDING*>(Context.Binding.BindingContext);
-    CXPLAT_SOCKET* Socket = Binding->Socket;
-    QUIC_ADDR RemoteAddress {};
-    QuicAddrSetFamily(&RemoteAddress, QUIC_ADDRESS_FAMILY_INET);
-    RemoteAddress.Ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    QuicAddrSetPort(&RemoteAddress, 9);
-    for (uint16_t Partition = 0;
-         Partition < (uint16_t)CxPlatProcCount();
-         ++Partition) {
-        CXPLAT_ROUTE Route {};
-        if (QUIC_SUCCEEDED(
-                CxPlatSocketGetRouteForPartition(
-                    Socket,
-                    Partition,
-                    &RemoteAddress,
-                    &Route))) {
-            return CxPlatSocketGetLocalMtu(Socket, &Route);
-        }
-    }
-    return 0;
+    uint16_t LocalMtu = 0;
+    uint64_t SendExtensionDrops = 0;
+    uint64_t RecvExtensionDrops = 0;
+    return
+        QuicBindingIceGetTestState(
+            Context.Binding.BindingContext,
+            &LocalMtu,
+            &SendExtensionDrops,
+            &RecvExtensionDrops) ?
+                LocalMtu : 0;
 }
 
 QUIC_STATUS
@@ -1152,16 +1147,16 @@ TEST(IceDatapath, RelayFailureCountsAsSendExtensionDrop)
         QUIC_STATUS_SUCCESS,
         Connection.SetParam(
             QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
-    auto* Binding =
-        static_cast<QUIC_BINDING*>(Context.Binding.BindingContext);
-    auto LoadCounter = [](uint64_t* Counter) {
-        return (uint64_t)InterlockedCompareExchange64(
-            (int64_t*)Counter, 0, 0);
-    };
-    const uint64_t InitialSendDrops =
-        LoadCounter(&Binding->Stats.Send.ExtensionDrop);
-    const uint64_t InitialRecvDrops =
-        LoadCounter(&Binding->Stats.Recv.ExtensionDrop);
+    uint16_t LocalMtu = 0;
+    uint64_t InitialSendDrops = 0;
+    uint64_t InitialRecvDrops = 0;
+    const BOOLEAN InitialStateResult =
+        QuicBindingIceGetTestState(
+            Context.Binding.BindingContext,
+            &LocalMtu,
+            &InitialSendDrops,
+            &InitialRecvDrops);
+    ASSERT_TRUE(InitialStateResult);
     ASSERT_EQ(0u, InitialSendDrops);
     ASSERT_EQ(0u, InitialRecvDrops);
     ASSERT_EQ(
@@ -1181,16 +1176,21 @@ TEST(IceDatapath, RelayFailureCountsAsSendExtensionDrop)
             "127.0.0.1",
             QuicAddrGetPort(&Receiver.Address))));
     ASSERT_TRUE(Context.RelayEvent.WaitTimeout(2000));
-    for (uint32_t Retry = 0;
-         Retry != 100 &&
-             LoadCounter(&Binding->Stats.Send.ExtensionDrop) == 0;
-         ++Retry) {
+    uint64_t FinalSendDrops = 0;
+    uint64_t FinalRecvDrops = 0;
+    for (uint32_t Retry = 0; Retry != 100; ++Retry) {
+        const BOOLEAN StateResult =
+            QuicBindingIceGetTestState(
+                Context.Binding.BindingContext,
+                &LocalMtu,
+                &FinalSendDrops,
+                &FinalRecvDrops);
+        ASSERT_TRUE(StateResult);
+        if (FinalSendDrops != 0) {
+            break;
+        }
         CxPlatSleep(1);
     }
-    const uint64_t FinalSendDrops =
-        LoadCounter(&Binding->Stats.Send.ExtensionDrop);
-    const uint64_t FinalRecvDrops =
-        LoadCounter(&Binding->Stats.Recv.ExtensionDrop);
     EXPECT_GT(FinalSendDrops, 0u);
     EXPECT_EQ(0u, FinalRecvDrops);
     Connection.Close();

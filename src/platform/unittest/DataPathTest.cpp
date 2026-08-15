@@ -809,6 +809,31 @@ TEST_P(DataPathTest, EnumerateSendDatagramsValidatesBeforeCallback)
             SendData, 3, 9, RecordEnumeratedDatagram, &MismatchedBytes));
     EXPECT_EQ(0u, MismatchedBytes.Count);
 
+    // Counts and bytes are accumulated in uint64_t by the visitor. The
+    // platform backing is bounded, so UINT32_MAX expectations exercise the
+    // public-width boundary without requiring an unconstructible overflow.
+    DatagramEnumerationContext MaximumExpectedCount;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData,
+            UINT32_MAX,
+            10,
+            RecordEnumeratedDatagram,
+            &MaximumExpectedCount));
+    EXPECT_EQ(0u, MaximumExpectedCount.Count);
+
+    DatagramEnumerationContext MaximumExpectedBytes;
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_PARAMETER,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData,
+            3,
+            UINT32_MAX,
+            RecordEnumeratedDatagram,
+            &MaximumExpectedBytes));
+    EXPECT_EQ(0u, MaximumExpectedBytes.Count);
+
     DatagramEnumerationContext Enumeration;
     EXPECT_EQ(
         QUIC_STATUS_SUCCESS,
@@ -824,7 +849,7 @@ TEST_P(DataPathTest, EnumerateSendDatagramsValidatesBeforeCallback)
     CxPlatSendDataFree(SendData);
 }
 
-TEST_P(DataPathTest, EnumerateNonGsoMultiBufferSendDatagrams)
+TEST_P(DataPathTest, EnumerateNonGsoSendDatagrams)
 {
     CxPlatDataPath Datapath(
         &EmptyUdpCallbacks, nullptr, 0, nullptr, true);
@@ -841,24 +866,37 @@ TEST_P(DataPathTest, EnumerateNonGsoMultiBufferSendDatagrams)
         &Socket.Route, 0, CXPLAT_ECN_NON_ECT, 0, CXPLAT_DSCP_CS0};
     CXPLAT_SEND_DATA* SendData = CxPlatSendDataAlloc(Socket, &SendConfig);
     ASSERT_NE(nullptr, SendData);
+#ifdef __linux__
     const std::array<std::vector<uint8_t>, 3> Datagrams = {{
         {0, 1, 2},
         {3, 4, 5, 6, 7},
         {8, 9}}};
+#else
+    // Windows user-mode and kqueue non-segmented sends have a one-backing
+    // batch limit. Their visitor coverage therefore uses the constructible
+    // single-buffer representation.
+    const std::array<std::vector<uint8_t>, 1> Datagrams = {{{0, 1, 2}}};
+#endif
+    uint32_t ExpectedBytes = 0;
     for (const auto& Bytes : Datagrams) {
         QUIC_BUFFER* Buffer =
             CxPlatSendDataAllocBuffer(SendData, (uint16_t)Bytes.size());
         ASSERT_NE(nullptr, Buffer);
         CxPlatCopyMemory(Buffer->Buffer, Bytes.data(), Bytes.size());
+        ExpectedBytes += (uint32_t)Bytes.size();
     }
 
     DatagramEnumerationContext Enumeration;
     EXPECT_EQ(
         QUIC_STATUS_SUCCESS,
         CxPlatSendDataEnumerateDatagrams(
-            SendData, 3, 10, RecordEnumeratedDatagram, &Enumeration));
-    EXPECT_EQ(3u, Enumeration.Count);
-    EXPECT_EQ(10u, Enumeration.Bytes);
+            SendData,
+            (uint32_t)Datagrams.size(),
+            ExpectedBytes,
+            RecordEnumeratedDatagram,
+            &Enumeration));
+    EXPECT_EQ(Datagrams.size(), Enumeration.Count);
+    EXPECT_EQ(ExpectedBytes, Enumeration.Bytes);
     ASSERT_EQ(Datagrams.size(), Enumeration.Datagrams.size());
     for (size_t i = 0; i < Datagrams.size(); ++i) {
         EXPECT_EQ(Datagrams[i], Enumeration.Datagrams[i]);
