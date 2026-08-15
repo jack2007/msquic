@@ -1809,10 +1809,8 @@ QuicConnStart(
     if (Connection->IceDatapathConfigured &&
         Path->Binding != NULL &&
         Path->Binding->CompartmentId != Configuration->CompartmentId) {
-        if (ServerName != NULL) {
-            CXPLAT_FREE(ServerName, QUIC_POOL_SERVERNAME);
-        }
-        return QUIC_STATUS_INVALID_STATE;
+        Status = QUIC_STATUS_INVALID_STATE;
+        goto Exit;
     }
 #endif
 
