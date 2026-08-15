@@ -228,10 +228,11 @@ QuicBindingUninitialize(
     // synchronously perform the last binding release; close work that could do
     // so must be queued to a worker.
     //
-    if (Binding->IceExtension.Configured && Binding->IceExtension.Bound) {
+    if (Binding->IceExtension.Configured &&
+        InterlockedCompareExchange(
+            &Binding->IceExtension.Bound, FALSE, TRUE)) {
         Binding->IceExtension.Config.Unbound(
             Binding->IceExtension.Config.Context);
-        Binding->IceExtension.Bound = FALSE;
     }
 
     CxPlatSocketDelete(Binding->Socket);
@@ -353,7 +354,8 @@ QuicBindingPrepareIceExtensionLocked(
 
     if (Extension->Configured) {
         return
-            Extension->Bound && !Extension->Installing &&
+            Extension->Bound &&
+            !Extension->Installing &&
             QuicBindingIceConfigIsCompatible(&Extension->Config, Config) ?
                 QUIC_STATUS_SUCCESS : QUIC_STATUS_INVALID_STATE;
     }
@@ -560,7 +562,8 @@ QuicBindingCommitIceExtension(
     CXPLAT_DBG_ASSERT(Binding->IceExtension.Installing);
     CXPLAT_DBG_ASSERT(!Binding->IceExtension.Bound);
     Binding->IceExtension.Installing = FALSE;
-    Binding->IceExtension.Bound = TRUE;
+    CXPLAT_DBG_ASSERT(!InterlockedCompareExchange(
+        &Binding->IceExtension.Bound, TRUE, FALSE));
     CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
 
     // This may synchronously uninitialize the binding. It must be the final
@@ -1969,6 +1972,57 @@ QuicBindingDeliverPackets(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static
+BOOLEAN
+QuicBindingIceReinjectOutputIsValid(
+    _In_ const QUIC_ICE_DATAGRAM_VIEW_V1* Input,
+    _In_ const QUIC_ICE_RX_OUTPUT_V1* Output
+    )
+{
+    if (Output->InnerBuffer == NULL || Output->InnerBufferLength == 0) {
+        return FALSE;
+    }
+
+    //
+    // Compare integer representations rather than relationally comparing
+    // potentially unrelated C pointers. The callback contract requires an
+    // inner view of this exact input datagram.
+    //
+    const uintptr_t InputStart = (uintptr_t)Input->Buffer;
+    const uintptr_t InnerStart = (uintptr_t)Output->InnerBuffer;
+    if (InnerStart < InputStart) {
+        return FALSE;
+    }
+    const uintptr_t InnerOffset = InnerStart - InputStart;
+    if (InnerOffset > Input->BufferLength ||
+        Output->InnerBufferLength > Input->BufferLength - InnerOffset) {
+        return FALSE;
+    }
+
+    const QUIC_ADDRESS_FAMILY Family =
+        QuicAddrGetFamily(&Output->InnerRemoteAddress);
+    return
+        (Family == QUIC_ADDRESS_FAMILY_INET || Family == QUIC_ADDRESS_FAMILY_INET6) &&
+        QuicAddrIsValid(&Output->InnerRemoteAddress) &&
+        !QuicAddrIsWildCard(&Output->InnerRemoteAddress) &&
+        QuicAddrGetPort(&Output->InnerRemoteAddress) != 0;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+BOOLEAN
+QuicBindingIceBoundIsPublished(
+    _In_ volatile long* Bound
+    )
+{
+#if defined(_WIN32) || defined(_KERNEL_MODE)
+    return ReadNoFence(Bound) != FALSE;
+#else
+    return __atomic_load_n(Bound, __ATOMIC_RELAXED) != FALSE;
+#endif
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 _Function_class_(CXPLAT_DATAPATH_RECEIVE_CALLBACK)
 void
 QuicBindingReceive(
@@ -2057,6 +2111,92 @@ QuicBindingReceive(
             }
         }
 #endif
+
+        //
+        // ICE control and relay traffic share this UDP binding with QUIC.
+        // The extension gets a stack-only view and is never given the
+        // CXPLAT_RECV_DATA lifetime. Legacy bindings skip this branch.
+        //
+        if (QuicBindingIceBoundIsPublished(&Binding->IceExtension.Bound)) {
+            if (!CxPlatRundownAcquire(&Binding->IceExtension.UpcallRundown)) {
+                InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                QuicPacketLogDrop(Binding, Packet, "ICE extension rundown");
+                *ReleaseChainTail = Datagram;
+                ReleaseChainTail = &Datagram->Next;
+                continue;
+            }
+
+            // Bound is the release-published install gate. Recheck it after
+            // entering rundown so an installing/unbinding extension is never
+            // called with a half-published context.
+            const BOOLEAN ExtensionClosing = Binding->IceExtension.Closing;
+            if (!QuicBindingIceBoundIsPublished(&Binding->IceExtension.Bound) ||
+                ExtensionClosing) {
+                CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+                if (ExtensionClosing) {
+                    InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                    QuicPacketLogDrop(Binding, Packet, "ICE extension closing");
+                    *ReleaseChainTail = Datagram;
+                    ReleaseChainTail = &Datagram->Next;
+                    continue;
+                }
+            } else {
+
+                QUIC_ICE_DATAGRAM_VIEW_V1 Input = {
+                    Datagram->Buffer,
+                    Datagram->BufferLength,
+                    Datagram->Route->LocalAddress,
+                    Datagram->Route->RemoteAddress,
+                    Datagram->PartitionIndex,
+                    Datagram->TypeOfService
+                };
+                QUIC_ICE_RX_OUTPUT_V1 Output = {0};
+                QUIC_ICE_RX_DISPOSITION Disposition =
+                    Binding->IceExtension.Config.Receive(
+                        Binding->IceExtension.Config.Context,
+                        &Input,
+                        &Output);
+                CxPlatRundownRelease(&Binding->IceExtension.UpcallRundown);
+
+                if (Disposition != Output.Disposition) {
+                    InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                    QuicPacketLogDrop(Binding, Packet, "ICE disposition mismatch");
+                    *ReleaseChainTail = Datagram;
+                    ReleaseChainTail = &Datagram->Next;
+                    continue;
+                }
+
+                if (Disposition == QUIC_ICE_RX_CONSUMED) {
+                    InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.IceControl);
+                    *ReleaseChainTail = Datagram;
+                    ReleaseChainTail = &Datagram->Next;
+                    continue;
+                }
+
+                if (Disposition == QUIC_ICE_RX_REINJECT_QUIC) {
+                    if (!QuicBindingIceReinjectOutputIsValid(&Input, &Output)) {
+                        InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                        QuicPacketLogDrop(Binding, Packet, "ICE invalid reinject output");
+                        *ReleaseChainTail = Datagram;
+                        ReleaseChainTail = &Datagram->Next;
+                        continue;
+                    }
+
+                    Datagram->Buffer = (uint8_t*)Output.InnerBuffer;
+                    Datagram->BufferLength = (uint16_t)Output.InnerBufferLength;
+                    Datagram->Route->RemoteAddress = Output.InnerRemoteAddress;
+                    Packet->AvailBuffer = Output.InnerBuffer;
+                    Packet->AvailBufferLength = (uint16_t)Output.InnerBufferLength;
+                    InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.RelayInner);
+                } else if (Disposition != QUIC_ICE_RX_PASS) {
+                    InterlockedIncrement64((int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                    QuicPacketLogDrop(Binding, Packet, "ICE unknown disposition");
+                    *ReleaseChainTail = Datagram;
+                    ReleaseChainTail = &Datagram->Next;
+                    continue;
+                }
+            }
+        }
 
         //
         // Perform initial validation.

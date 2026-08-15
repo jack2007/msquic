@@ -18,7 +18,7 @@ typedef struct QUIC_ICE_EXTENSION {
     volatile long Closing;
     BOOLEAN Configured;
     BOOLEAN Installing;
-    BOOLEAN Bound;
+    volatile long Bound;
 } QUIC_ICE_EXTENSION;
 
 typedef struct QUIC_ICE_INSTALL_TOKEN {
@@ -298,6 +298,14 @@ typedef struct QUIC_BINDING {
 
         struct {
             uint64_t DroppedPackets;
+            //
+            // ICE extension receive dispositions. These fields are updated
+            // with interlocked operations because server bindings receive on
+            // more than one partition concurrently.
+            //
+            uint64_t IceControl;
+            uint64_t RelayInner;
+            uint64_t ExtensionDrop;
         } Recv;
 
     } Stats;

@@ -12,6 +12,8 @@
 #include "msquic_ice.h"
 
 #include <atomic>
+#include <array>
+#include <cstdint>
 #include <thread>
 
 namespace {
@@ -27,15 +29,132 @@ struct IceCallbackContext {
     QUIC_ADDR LocalAddress {};
     HQUIC StopListenerOnBound {nullptr};
     bool BlockBound {false};
+    enum class RxAction {
+        Pass,
+        Consumed,
+        Reinject,
+        MismatchedDisposition,
+        BeforeBuffer,
+        OutOfBounds,
+        OverflowLength,
+        NullInnerBuffer,
+        EmptyInnerBuffer,
+        WildcardRemote,
+        ZeroPortRemote,
+        UnknownDisposition
+    };
+    std::atomic<RxAction> Action {RxAction::Pass};
+    std::atomic<uint32_t> ReceiveCount {0};
+    CxPlatEvent ReceiveEvent;
+    CxPlatEvent ReceiveEntered;
+    CxPlatEvent AllowReceiveReturn;
+    std::atomic<bool> BlockReceive {false};
+    CxPlatLock ReceiveLock;
+    uint32_t LastReceiveLength {0};
+    std::array<uint8_t, 24> LastReceiveBytes {};
+    QUIC_ADDR LastReceiveLocalAddress {};
+    QUIC_ADDR LastReceiveRemoteAddress {};
+    uint16_t LastReceivePartitionIndex {0};
+    uint8_t LastReceiveTypeOfService {0};
 };
 
 QUIC_ICE_RX_DISPOSITION
 QUIC_API
 IceReceive(
-    void*,
-    const QUIC_ICE_DATAGRAM_VIEW_V1*,
-    QUIC_ICE_RX_OUTPUT_V1*)
+    void* Context,
+    const QUIC_ICE_DATAGRAM_VIEW_V1* Input,
+    QUIC_ICE_RX_OUTPUT_V1* Output)
 {
+    auto* CallbackContext = static_cast<IceCallbackContext*>(Context);
+    struct ReceiveEventGuard {
+        CxPlatEvent& Event;
+        ~ReceiveEventGuard() { Event.Set(); }
+    } EventGuard {CallbackContext->ReceiveEvent};
+    {
+        LockGuard LockScope{CallbackContext->ReceiveLock};
+        CallbackContext->LastReceiveLength = Input->BufferLength;
+        CxPlatCopyMemory(
+            CallbackContext->LastReceiveBytes.data(),
+            Input->Buffer,
+            Input->BufferLength < CallbackContext->LastReceiveBytes.size() ?
+                Input->BufferLength : (uint32_t)CallbackContext->LastReceiveBytes.size());
+        CallbackContext->LastReceiveLocalAddress = Input->LocalAddress;
+        CallbackContext->LastReceiveRemoteAddress = Input->RemoteAddress;
+        CallbackContext->LastReceivePartitionIndex = Input->PartitionIndex;
+        CallbackContext->LastReceiveTypeOfService = Input->TypeOfService;
+    }
+    CallbackContext->ReceiveCount.fetch_add(1, std::memory_order_relaxed);
+    *Output = {};
+
+    const auto Action = CallbackContext->Action.load(std::memory_order_acquire);
+    CallbackContext->ReceiveEntered.Set();
+    if (CallbackContext->BlockReceive.load(std::memory_order_acquire)) {
+        CallbackContext->AllowReceiveReturn.WaitForever();
+    }
+    switch (Action) {
+    case IceCallbackContext::RxAction::Pass:
+        Output->Disposition = QUIC_ICE_RX_PASS;
+        return QUIC_ICE_RX_PASS;
+    case IceCallbackContext::RxAction::Consumed:
+        Output->Disposition = QUIC_ICE_RX_CONSUMED;
+        return QUIC_ICE_RX_CONSUMED;
+    case IceCallbackContext::RxAction::Reinject:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + 4;
+        Output->InnerBufferLength = Input->BufferLength - 4;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::MismatchedDisposition:
+        Output->Disposition = QUIC_ICE_RX_CONSUMED;
+        return QUIC_ICE_RX_PASS;
+    case IceCallbackContext::RxAction::BeforeBuffer:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = reinterpret_cast<const uint8_t*>(
+            reinterpret_cast<uintptr_t>(Input->Buffer) - 1);
+        Output->InnerBufferLength = 1;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::OutOfBounds:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + Input->BufferLength;
+        Output->InnerBufferLength = 1;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::OverflowLength:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + 1;
+        Output->InnerBufferLength = UINT32_MAX;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::NullInnerBuffer:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBufferLength = 1;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::EmptyInnerBuffer:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::WildcardRemote:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + 4;
+        Output->InnerBufferLength = Input->BufferLength - 4;
+        QuicAddrSetFamily(&Output->InnerRemoteAddress, QUIC_ADDRESS_FAMILY_INET);
+        QuicAddrSetPort(&Output->InnerRemoteAddress, 443);
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::ZeroPortRemote:
+        Output->Disposition = QUIC_ICE_RX_REINJECT_QUIC;
+        Output->InnerBuffer = Input->Buffer + 4;
+        Output->InnerBufferLength = Input->BufferLength - 4;
+        Output->InnerRemoteAddress = Input->RemoteAddress;
+        QuicAddrSetPort(&Output->InnerRemoteAddress, 0);
+        return QUIC_ICE_RX_REINJECT_QUIC;
+    case IceCallbackContext::RxAction::UnknownDisposition:
+        Output->Disposition = (QUIC_ICE_RX_DISPOSITION)99;
+        return (QUIC_ICE_RX_DISPOSITION)99;
+    }
+
     return QUIC_ICE_RX_PASS;
 }
 
@@ -161,6 +280,87 @@ ValidateConfigShape(
         MsQuic->SetParam(Handle, Param, sizeof(Config), &Config));
 
     ValidateMissingCallbacks(Handle, Param, ValidConfig);
+}
+
+void
+SendIceDatagram(
+    const QUIC_ADDR& RemoteAddress,
+    const uint8_t* Buffer,
+    uint16_t BufferLength)
+{
+#ifdef _WIN32
+    SOCKET Socket = socket(RemoteAddress.Ip.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_NE(INVALID_SOCKET, Socket);
+#else
+    int Socket = socket(RemoteAddress.Ip.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_GE(Socket, 0);
+#endif
+    const int Sent =
+        sendto(
+            Socket,
+            reinterpret_cast<const char*>(Buffer),
+            BufferLength,
+            0,
+            &RemoteAddress.Ip,
+            RemoteAddress.Ip.sa_family == AF_INET ?
+                sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+    ASSERT_EQ(BufferLength, Sent);
+#ifdef _WIN32
+    closesocket(Socket);
+#else
+    close(Socket);
+#endif
+}
+
+void
+SendIceDatagramAndWait(
+    IceCallbackContext& Context,
+    const QUIC_ADDR& RemoteAddress,
+    const uint8_t* Buffer,
+    uint16_t BufferLength)
+{
+    Context.ReceiveEvent.Reset();
+    SendIceDatagram(RemoteAddress, Buffer, BufferLength);
+    ASSERT_TRUE(Context.ReceiveEvent.WaitTimeout(2000));
+    LockGuard LockScope{Context.ReceiveLock};
+    EXPECT_EQ(BufferLength, Context.LastReceiveLength);
+    ASSERT_LE(BufferLength, Context.LastReceiveBytes.size());
+    EXPECT_EQ(0, memcmp(Buffer, Context.LastReceiveBytes.data(), BufferLength));
+    EXPECT_EQ(QUIC_ADDRESS_FAMILY_INET, QuicAddrGetFamily(&Context.LastReceiveLocalAddress));
+    EXPECT_NE(0, QuicAddrGetPort(&Context.LastReceiveLocalAddress));
+    EXPECT_EQ(QUIC_ADDRESS_FAMILY_INET, QuicAddrGetFamily(&Context.LastReceiveRemoteAddress));
+    EXPECT_NE(0, QuicAddrGetPort(&Context.LastReceiveRemoteAddress));
+    EXPECT_LT(Context.LastReceivePartitionIndex, CxPlatProcCount());
+    EXPECT_EQ(0, Context.LastReceiveTypeOfService);
+}
+
+uint64_t
+GetListenerDroppedPackets(const MsQuicListener& Listener)
+{
+    QUIC_LISTENER_STATISTICS Stats = {};
+    uint32_t StatsLength = sizeof(Stats);
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        MsQuic->GetParam(
+            Listener.Handle,
+            QUIC_PARAM_LISTENER_STATS,
+            &StatsLength,
+            &Stats));
+    return Stats.BindingRecvDroppedPackets;
+}
+
+bool
+WaitForListenerDroppedPackets(
+    const MsQuicListener& Listener,
+    uint64_t Expected)
+{
+    for (uint32_t Attempt = 0; Attempt < 2000; ++Attempt) {
+        if (GetListenerDroppedPackets(Listener) == Expected) {
+            return true;
+        }
+        CxPlatSleep(1);
+    }
+    return false;
 }
 
 } // namespace
@@ -643,5 +843,161 @@ TEST(IceDatapath, PreparedBindingFailureRollsBack)
 
     Connection.Close();
     ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, ReceiveDemuxPassConsumedAndReinject)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    MsQuicAlpn Alpn("IceReceiveDemux");
+    QuicAddr LocalAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    LocalAddress.SetPort(0);
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn, &LocalAddress.SockAddr));
+
+    uint32_t LocalAddressLength = sizeof(LocalAddress.SockAddr);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        MsQuic->GetParam(
+            Listener.Handle,
+            QUIC_PARAM_LISTENER_LOCAL_ADDRESS,
+            &LocalAddressLength,
+            &LocalAddress.SockAddr));
+    const uint64_t InitialDroppedPackets = GetListenerDroppedPackets(Listener);
+
+    const std::array<uint8_t, 20> Stun = {
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x02};
+    Context.Action.store(IceCallbackContext::RxAction::Consumed, std::memory_order_release);
+    SendIceDatagramAndWait(Context, LocalAddress.SockAddr, Stun.data(), Stun.size());
+    ASSERT_TRUE(WaitForListenerDroppedPackets(Listener, InitialDroppedPackets));
+
+    const std::array<uint8_t, 1> Quic = {0xC0};
+    Context.Action.store(IceCallbackContext::RxAction::Pass, std::memory_order_release);
+    SendIceDatagramAndWait(Context, LocalAddress.SockAddr, Quic.data(), Quic.size());
+    EXPECT_TRUE(WaitForListenerDroppedPackets(Listener, InitialDroppedPackets + 1));
+
+    const std::array<uint8_t, 5> ChannelData = {
+        0x40, 0x01, 0x00, 0x01, 0xC0};
+    Context.Action.store(IceCallbackContext::RxAction::Reinject, std::memory_order_release);
+    SendIceDatagramAndWait(
+        Context, LocalAddress.SockAddr, ChannelData.data(), ChannelData.size());
+    EXPECT_TRUE(WaitForListenerDroppedPackets(Listener, InitialDroppedPackets + 2));
+    EXPECT_EQ(3u, Context.ReceiveCount.load(std::memory_order_relaxed));
+    Listener.Close();
+}
+
+TEST(IceDatapath, ReceiveDemuxFailsClosedForMalformedOutput)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    MsQuicAlpn Alpn("IceMalformedOutput");
+    QuicAddr LocalAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    LocalAddress.SetPort(0);
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn, &LocalAddress.SockAddr));
+    uint32_t LocalAddressLength = sizeof(LocalAddress.SockAddr);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        MsQuic->GetParam(
+            Listener.Handle,
+            QUIC_PARAM_LISTENER_LOCAL_ADDRESS,
+            &LocalAddressLength,
+            &LocalAddress.SockAddr));
+    const uint64_t InitialDroppedPackets = GetListenerDroppedPackets(Listener);
+
+    const std::array<uint8_t, 5> ChannelData = {
+        0x40, 0x01, 0x00, 0x01, 0xC0};
+    const std::array<IceCallbackContext::RxAction, 9> Actions = {
+        IceCallbackContext::RxAction::MismatchedDisposition,
+        IceCallbackContext::RxAction::BeforeBuffer,
+        IceCallbackContext::RxAction::OutOfBounds,
+        IceCallbackContext::RxAction::OverflowLength,
+        IceCallbackContext::RxAction::NullInnerBuffer,
+        IceCallbackContext::RxAction::EmptyInnerBuffer,
+        IceCallbackContext::RxAction::WildcardRemote,
+        IceCallbackContext::RxAction::ZeroPortRemote,
+        IceCallbackContext::RxAction::UnknownDisposition};
+    uint64_t ExpectedDroppedPackets = InitialDroppedPackets;
+    for (const auto Action : Actions) {
+        Context.Action.store(Action, std::memory_order_release);
+        SendIceDatagramAndWait(
+            Context, LocalAddress.SockAddr, ChannelData.data(), ChannelData.size());
+        EXPECT_TRUE(WaitForListenerDroppedPackets(
+            Listener, ++ExpectedDroppedPackets));
+    }
+    EXPECT_EQ(Actions.size(), Context.ReceiveCount.load(std::memory_order_relaxed));
+    Listener.Close();
+}
+
+TEST(IceDatapath, ReceiveRundownDrainsBeforeUnbound)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    MsQuicAlpn Alpn("IceReceiveRundown");
+    QuicAddr LocalAddress(QUIC_ADDRESS_FAMILY_INET, true);
+    LocalAddress.SetPort(0);
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn, &LocalAddress.SockAddr));
+    uint32_t LocalAddressLength = sizeof(LocalAddress.SockAddr);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        MsQuic->GetParam(
+            Listener.Handle,
+            QUIC_PARAM_LISTENER_LOCAL_ADDRESS,
+            &LocalAddressLength,
+            &LocalAddress.SockAddr));
+
+    const std::array<uint8_t, 1> Quic = {0xC0};
+    Context.BlockReceive.store(true, std::memory_order_release);
+    std::thread SendThread([&]() {
+        SendIceDatagram(LocalAddress.SockAddr, Quic.data(), Quic.size());
+    });
+    const bool ReceiveEntered = Context.ReceiveEntered.WaitTimeout(2000);
+    if (!ReceiveEntered) {
+        Context.AllowReceiveReturn.Set();
+        SendThread.join();
+        Listener.Close();
+        ADD_FAILURE() << "ICE receive callback did not enter";
+        return;
+    }
+
+    std::thread CloseThread([&]() { Listener.Close(); });
+    EXPECT_FALSE(Context.UnboundEvent.WaitTimeout(50));
+    Context.AllowReceiveReturn.Set();
+    SendThread.join();
+    CloseThread.join();
+
+    EXPECT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
     EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
 }
