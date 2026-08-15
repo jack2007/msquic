@@ -17,8 +17,14 @@ typedef struct QUIC_ICE_EXTENSION {
     volatile long PathType;
     volatile long Closing;
     BOOLEAN Configured;
+    BOOLEAN Installing;
     BOOLEAN Bound;
 } QUIC_ICE_EXTENSION;
+
+typedef struct QUIC_ICE_INSTALL_TOKEN {
+    BOOLEAN FirstInstall;
+    BOOLEAN BindingRefHeld;
+} QUIC_ICE_INSTALL_TOKEN;
 
 //
 // Structure that MsQuic servers use for encoding data for stateless retries and
@@ -307,21 +313,24 @@ typedef struct QUIC_BINDING {
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_STATUS
-QuicBindingAttachIceExtension(
+QuicBindingReserveIceExtension(
     _In_ QUIC_BINDING* Binding,
-    _In_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config
+    _In_opt_ const QUIC_ICE_DATAPATH_CONFIG_V1* Config,
+    _Out_ QUIC_ICE_INSTALL_TOKEN* Token
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-const QUIC_ICE_DATAPATH_CONFIG_V1*
-QuicBindingIceAcquireUpcall(
-    _In_ QUIC_BINDING* Binding
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicBindingCommitIceExtension(
+    _In_ QUIC_BINDING* Binding,
+    _Inout_ QUIC_ICE_INSTALL_TOKEN* Token
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(PASSIVE_LEVEL)
 void
-QuicBindingIceReleaseUpcall(
-    _In_ QUIC_BINDING* Binding
+QuicBindingAbortIceExtension(
+    _In_ QUIC_BINDING* Binding,
+    _Inout_ QUIC_ICE_INSTALL_TOKEN* Token
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -415,7 +424,8 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_STATUS
 QuicBindingRegisterListener(
     _In_ QUIC_BINDING* Binding,
-    _In_ QUIC_LISTENER* Listener
+    _In_ QUIC_LISTENER* Listener,
+    _Out_ QUIC_ICE_INSTALL_TOKEN* IceToken
     );
 
 //

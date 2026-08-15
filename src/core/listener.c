@@ -230,6 +230,8 @@ MsQuicListenerStart(
     uint32_t AlpnListLength;
     BOOLEAN PortUnspecified;
     QUIC_ADDR BindingLocalAddress = {0};
+    QUIC_BINDING* IceBinding = NULL;
+    QUIC_ICE_INSTALL_TOKEN IceToken = {0};
 
     QuicTraceEvent(
         ApiEnter,
@@ -371,12 +373,17 @@ MsQuicListenerStart(
             "Get binding");
         goto Error;
     }
+    IceBinding = Listener->Binding;
 
     Listener->Stopped = FALSE;
     CxPlatEventReset(Listener->StopEvent);
     CxPlatRefInitialize(&Listener->StartRefCount);
 
-    Status = QuicBindingRegisterListener(Listener->Binding, Listener);
+    Status =
+        QuicBindingRegisterListener(
+            IceBinding,
+            Listener,
+            &IceToken);
     if (QUIC_FAILED(Status)) {
         QuicTraceEvent(
             ListenerErrorStatus,
@@ -389,7 +396,7 @@ MsQuicListenerStart(
     }
 
     if (PortUnspecified) {
-        QuicBindingGetLocalAddress(Listener->Binding, &BindingLocalAddress);
+        QuicBindingGetLocalAddress(IceBinding, &BindingLocalAddress);
         QuicAddrSetPort(
             &Listener->LocalAddress,
             QuicAddrGetPort(&BindingLocalAddress));
@@ -399,13 +406,24 @@ MsQuicListenerStart(
         ListenerStarted,
         "[list][%p] Started, Binding=%p, LocalAddr=%!ADDR!, ALPN=%!ALPN!",
         Listener,
-        Listener->Binding,
+        IceBinding,
         CASTED_CLOG_BYTEARRAY(sizeof(Listener->LocalAddress), &Listener->LocalAddress),
         CASTED_CLOG_BYTEARRAY(Listener->AlpnListLength, Listener->AlpnList));
+
+    // Bound may synchronously stop and release the listener. Capture the
+    // binding first and make commit the final owner-state operation.
+    Status = QuicBindingCommitIceExtension(IceBinding, &IceToken);
+    if (QUIC_FAILED(Status)) {
+        goto Error;
+    }
+    goto Exit;
 
 Error:
 
     if (QUIC_FAILED(Status)) {
+        if (IceToken.FirstInstall) {
+            QuicBindingAbortIceExtension(IceBinding, &IceToken);
+        }
         if (Listener->Binding != NULL) {
             QuicLibraryReleaseBinding(Listener->Binding);
             Listener->Binding = NULL;

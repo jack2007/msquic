@@ -12,6 +12,7 @@
 #include "msquic_ice.h"
 
 #include <atomic>
+#include <thread>
 
 namespace {
 
@@ -20,8 +21,12 @@ struct IceCallbackContext {
     std::atomic<uint32_t> UnboundCount {0};
     CxPlatEvent BoundEvent;
     CxPlatEvent UnboundEvent;
+    CxPlatEvent BoundEntered;
+    CxPlatEvent AllowBoundReturn;
     QUIC_ICE_BINDING_API_V1 Binding {};
     QUIC_ADDR LocalAddress {};
+    HQUIC StopListenerOnBound {nullptr};
+    bool BlockBound {false};
 };
 
 QUIC_ICE_RX_DISPOSITION
@@ -56,6 +61,13 @@ IceBound(
     CallbackContext->LocalAddress = *LocalAddress;
     CallbackContext->BoundCount.fetch_add(1, std::memory_order_relaxed);
     CallbackContext->BoundEvent.Set();
+    CallbackContext->BoundEntered.Set();
+    if (CallbackContext->StopListenerOnBound != nullptr) {
+        MsQuic->ListenerStop(CallbackContext->StopListenerOnBound);
+    }
+    if (CallbackContext->BlockBound) {
+        CallbackContext->AllowBoundReturn.WaitForever();
+    }
 }
 
 void
@@ -335,4 +347,147 @@ TEST(IceDatapath, LegacySharedBindingRejectsLaterIceContext)
         Ice.Start(IceAlpn, &BoundAddress.SockAddr));
     EXPECT_EQ(0u, Context.BoundCount.load(std::memory_order_relaxed));
     EXPECT_EQ(0u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, IceSharedBindingRejectsLaterLegacyListener)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Ice(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Ice.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Ice.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    MsQuicAlpn IceAlpn("IceFirst");
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Ice.Start(IceAlpn));
+
+    QuicAddr BoundAddress;
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Ice.GetLocalAddr(BoundAddress));
+
+    MsQuicListener Legacy(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Legacy.IsValid());
+    MsQuicAlpn LegacyAlpn("LegacySecond");
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Legacy.Start(LegacyAlpn, &BoundAddress.SockAddr));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+
+    Ice.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, ConnectionRejectsSharedUdpBindingInBothSetOrders)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+    uint8_t ShareBinding = TRUE;
+
+    IceCallbackContext ShareFirstContext;
+    auto ShareFirstConfig = MakeIceConfig(&ShareFirstContext);
+    MsQuicConnection ShareFirst(Registration);
+    ASSERT_TRUE(ShareFirst.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        ShareFirst.SetParam(
+            QUIC_PARAM_CONN_SHARE_UDP_BINDING,
+            sizeof(ShareBinding),
+            &ShareBinding));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        ShareFirst.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG,
+            sizeof(ShareFirstConfig),
+            &ShareFirstConfig));
+
+    IceCallbackContext IceFirstContext;
+    auto IceFirstConfig = MakeIceConfig(&IceFirstContext);
+    MsQuicConnection IceFirst(Registration);
+    ASSERT_TRUE(IceFirst.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        IceFirst.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG,
+            sizeof(IceFirstConfig),
+            &IceFirstConfig));
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        IceFirst.SetParam(
+            QUIC_PARAM_CONN_SHARE_UDP_BINDING,
+            sizeof(ShareBinding),
+            &ShareBinding));
+}
+
+TEST(IceDatapath, ListenerStopFromBoundKeepsBindingAlive)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener Listener(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Listener.IsValid());
+    Context.StopListenerOnBound = Listener.Handle;
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Listener.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    MsQuicAlpn Alpn("StopFromBound");
+    EXPECT_EQ(QUIC_STATUS_SUCCESS, Listener.Start(Alpn));
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, BlockingBoundMakesConcurrentCompatibleStartFailFast)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    Context.BlockBound = true;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicListener First(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(First.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        First.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    MsQuicAlpn FirstAlpn("BlockingFirst");
+    QUIC_STATUS FirstStartStatus = QUIC_STATUS_ABORTED;
+    std::thread StartThread([&]() {
+        FirstStartStatus = First.Start(FirstAlpn);
+    });
+    ASSERT_TRUE(Context.BoundEntered.WaitTimeout(2000));
+
+    MsQuicListener Compatible(
+        Registration, CleanUpManual, IceListenerCallback);
+    ASSERT_TRUE(Compatible.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Compatible.SetParam(
+            QUIC_PARAM_LISTENER_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    MsQuicAlpn CompatibleAlpn("BlockingCompatible");
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Compatible.Start(CompatibleAlpn, &Context.LocalAddress));
+
+    First.Stop();
+    Context.AllowBoundReturn.Set();
+    StartThread.join();
+
+    EXPECT_EQ(QUIC_STATUS_SUCCESS, FirstStartStatus);
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
 }

@@ -1794,6 +1794,8 @@ QuicConnStart(
 {
     QUIC_STATUS Status;
     QUIC_PATH* Path = &Connection->Paths[0];
+    QUIC_BINDING* IceBinding = NULL;
+    QUIC_ICE_INSTALL_TOKEN IceToken = {0};
     CXPLAT_DBG_ASSERT(QuicConnIsClient(Connection));
 
     if (Connection->State.ClosedLocally || Connection->State.Started) {
@@ -1924,12 +1926,14 @@ QuicConnStart(
     if (QUIC_FAILED(Status)) {
         goto Exit;
     }
+    IceBinding = Path->Binding;
 
     Status =
-        QuicBindingAttachIceExtension(
-            Path->Binding,
+        QuicBindingReserveIceExtension(
+            IceBinding,
             Connection->IceDatapathConfigured ?
-                &Connection->IceDatapathConfig : NULL);
+                &Connection->IceDatapathConfig : NULL,
+            &IceToken);
     if (QUIC_FAILED(Status)) {
         QuicLibraryReleaseBinding(Path->Binding);
         Path->Binding = NULL;
@@ -1967,6 +1971,7 @@ QuicConnStart(
     CxPlatListPushEntry(&Connection->SourceCids, &SourceCid->Link);
 
     if (!QuicBindingAddSourceConnectionID(Path->Binding, SourceCid)) {
+        QuicBindingAbortIceExtension(IceBinding, &IceToken);
         QuicLibraryReleaseBinding(Path->Binding);
         Path->Binding = NULL;
         Status = QUIC_STATUS_OUT_OF_MEMORY;
@@ -2000,6 +2005,13 @@ QuicConnStart(
         goto Exit;
     }
 
+    // Bound may synchronously close and release the connection. Commit is the
+    // final operation that may touch connection-owned binding state.
+    Status = QuicBindingCommitIceExtension(IceBinding, &IceToken);
+    if (QUIC_FAILED(Status)) {
+        goto Exit;
+    }
+
 Exit:
 
     if (ServerName != NULL) {
@@ -2007,6 +2019,9 @@ Exit:
     }
 
     if (QUIC_FAILED(Status)) {
+        if (IceToken.FirstInstall) {
+            QuicBindingAbortIceExtension(IceBinding, &IceToken);
+        }
         if (StartFlags & QUIC_CONN_START_FLAG_FAIL_SILENTLY) {
             //
             // This connection was created internally (e.g. by the connection
@@ -6413,7 +6428,8 @@ QuicConnParamSet(
             break;
         }
 
-        if (Connection->State.Started || Connection->State.ClosedLocally) {
+        if (Connection->State.Started || Connection->State.ClosedLocally ||
+            Connection->State.ShareBinding) {
             Status = QUIC_STATUS_INVALID_STATE;
             break;
         }
@@ -6618,7 +6634,13 @@ QuicConnParamSet(
             break;
         }
 
-        Connection->State.ShareBinding = *(uint8_t*)Buffer;
+        if (*(const uint8_t*)Buffer != FALSE &&
+            Connection->IceDatapathConfigured) {
+            Status = QUIC_STATUS_INVALID_STATE;
+            break;
+        }
+
+        Connection->State.ShareBinding = *(const uint8_t*)Buffer;
 
         QuicTraceLogConnInfo(
             UpdateShareBinding,
