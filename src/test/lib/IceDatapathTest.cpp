@@ -55,6 +55,9 @@ struct IceCallbackContext {
     CxPlatEvent ReceiveEntered;
     CxPlatEvent AllowReceiveReturn;
     std::atomic<bool> BlockReceive {false};
+    CxPlatEvent SecondReceiveEntered;
+    CxPlatEvent AllowSecondReceiveReturn;
+    std::atomic<bool> BlockSecondReceive {false};
     CxPlatLock ReceiveLock;
     uint32_t LastReceiveLength {0};
     std::array<uint8_t, 24> LastReceiveBytes {};
@@ -209,9 +212,17 @@ IceReceive(
         }
         return QUIC_ICE_RX_REINJECT_QUIC;
     case IceCallbackContext::RxAction::ConsumedFirstThenPass:
-        Output->Disposition =
-            ReceiveIndex == 0 ? QUIC_ICE_RX_CONSUMED : QUIC_ICE_RX_PASS;
-        return Output->Disposition;
+        if (ReceiveIndex == 0) {
+            Output->Disposition = QUIC_ICE_RX_CONSUMED;
+            return QUIC_ICE_RX_CONSUMED;
+        }
+        Output->Disposition = QUIC_ICE_RX_PASS;
+        CallbackContext->SecondReceiveEntered.Set();
+        if (CallbackContext->BlockSecondReceive.load(
+                std::memory_order_acquire)) {
+            CallbackContext->AllowSecondReceiveReturn.WaitForever();
+        }
+        return QUIC_ICE_RX_PASS;
     }
 
     return QUIC_ICE_RX_PASS;
@@ -1091,28 +1102,35 @@ TEST(IceDatapath, ConsumedCompletesWithoutQuicPreprocess)
     // cannot invoke the second callback until it has applied the first
     // callback's CONSUMED disposition, which is the production completion
     // barrier needed for the final exact dropped-packet assertion.
-    const std::array<uint8_t, 40> Segments = {
-        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x02,
-        0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00};
+    const std::array<uint8_t, 10> Segments = {
+        0x40, 0x01, 0x00, 0x01, 0xC0,
+        0x40, 0x02, 0x00, 0x01, 0xC0};
     Context.Action.store(
         IceCallbackContext::RxAction::ConsumedFirstThenPass,
         std::memory_order_release);
+    Context.BlockSecondReceive.store(true, std::memory_order_release);
     QUIC_ADDR SenderAddress = {};
     if (!SendIceSegmentedDatagrams(
             LocalAddress.SockAddr,
             Segments.data(),
             Segments.size(),
-            20,
+            5,
             SenderAddress)) {
+        Context.AllowSecondReceiveReturn.Set();
         Listener.Close();
         GTEST_SKIP() << "UDP segmentation is unavailable";
     }
 
-    ASSERT_TRUE(WaitForReceiveCount(Context, 2));
+    if (!Context.SecondReceiveEntered.WaitTimeout(2000)) {
+        Context.AllowSecondReceiveReturn.Set();
+        Listener.Close();
+        ADD_FAILURE() << "second ICE receive callback did not enter";
+        return;
+    }
+    EXPECT_EQ(
+        InitialDroppedPackets,
+        GetListenerDroppedPackets(Listener));
+    Context.AllowSecondReceiveReturn.Set();
     EXPECT_TRUE(WaitForListenerDroppedPackets(
         Listener, InitialDroppedPackets + 1));
     EXPECT_EQ(2u, Context.ReceiveCount.load(std::memory_order_acquire));
