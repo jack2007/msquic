@@ -675,6 +675,9 @@ DataPathInitialize(
     if (QUIC_FAILED(Status)) {
         goto Error;
     }
+    if (InitConfig->DisableSendSegmentation) {
+        Datapath->Features &= ~CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION;
+    }
 
     //
     // Check for port reservation support.

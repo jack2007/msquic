@@ -399,7 +399,7 @@ QuicBindingPrepareIceExtensionLocked(
     return QUIC_STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 QuicBindingIceSelectedPathIsReady(
     _In_ QUIC_BINDING* Binding
@@ -2463,6 +2463,33 @@ QuicBindingIceSendRelayDatagram(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static
+void
+QuicBindingIceRecordSendDrop(
+    _In_ QUIC_BINDING* Binding
+    )
+{
+    InterlockedIncrement64(
+        (int64_t*)&Binding->Stats.Send.ExtensionDrop);
+    QuicTraceLogVerbose(
+        BindingSendTestDrop,
+        "[bind][%p] ICE extension dropped packet",
+        Binding);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+void
+QuicBindingIceDropSendData(
+    _In_ QUIC_BINDING* Binding,
+    _In_ CXPLAT_SEND_DATA* SendData
+    )
+{
+    QuicBindingIceRecordSendDrop(Binding);
+    CxPlatSendDataFree(SendData);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 void
 QuicBindingSend(
     _In_ QUIC_BINDING* Binding,
@@ -2477,9 +2504,7 @@ QuicBindingSend(
 #if defined(_KERNEL_MODE)
         // Kernel ICE TX is not part of private v1. SetSelectedPath rejects it,
         // and this remains the defensive fail-closed gate.
-        InterlockedIncrement64(
-            (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
-        CxPlatSendDataFree(SendData);
+        QuicBindingIceDropSendData(Binding, SendData);
         goto Complete;
 #else
         const long PathType =
@@ -2490,9 +2515,7 @@ QuicBindingSend(
         // normally rejects raw availability before this point; Route is the
         // final defensive gate for an already-created SendData.
         if (Route->DatapathType != CXPLAT_DATAPATH_TYPE_NORMAL) {
-            InterlockedIncrement64(
-                (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
-            CxPlatSendDataFree(SendData);
+            QuicBindingIceDropSendData(Binding, SendData);
             goto Complete;
         }
 
@@ -2504,9 +2527,7 @@ QuicBindingSend(
             if (!Binding->Exclusive || Binding->ServerOwned ||
                 !CxPlatRundownAcquire(
                     &Binding->IceExtension.UpcallRundown)) {
-                InterlockedIncrement64(
-                    (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
-                CxPlatSendDataFree(SendData);
+                QuicBindingIceDropSendData(Binding, SendData);
                 goto Complete;
             }
 
@@ -2533,16 +2554,13 @@ QuicBindingSend(
                 &Binding->IceExtension.UpcallRundown);
             CxPlatSendDataFree(SendData);
             if (QUIC_FAILED(Status)) {
-                InterlockedIncrement64(
-                    (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
+                QuicBindingIceRecordSendDrop(Binding);
             }
             goto Complete;
         }
 
         // UNSELECTED, INSTALLING and unknown states cannot send QUIC payload.
-        InterlockedIncrement64(
-            (int64_t*)&Binding->Stats.Recv.ExtensionDrop);
-        CxPlatSendDataFree(SendData);
+        QuicBindingIceDropSendData(Binding, SendData);
         goto Complete;
 #endif
     }

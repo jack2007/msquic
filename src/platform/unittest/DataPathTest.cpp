@@ -500,13 +500,15 @@ struct CxPlatDataPath {
         _In_opt_ const CXPLAT_UDP_DATAPATH_CALLBACKS* UdpCallbacks,
         _In_opt_ const CXPLAT_TCP_DATAPATH_CALLBACKS* TcpCallbacks = nullptr,
         _In_ uint32_t ClientRecvContextLength = 0,
-        _In_opt_ QUIC_GLOBAL_EXECUTION_CONFIG* Config = nullptr
+        _In_opt_ QUIC_GLOBAL_EXECUTION_CONFIG* Config = nullptr,
+        _In_ bool DisableSendSegmentation = false
         ) noexcept
     {
         WorkerPool =
             CxPlatWorkerPoolCreate(Config ? Config : &DefaultExecutionConfig, CXPLAT_WORKER_POOL_REF_TOOL);
         CXPLAT_DATAPATH_INIT_CONFIG InitConfig = {0};
         InitConfig.EnableDscpOnRecv = TRUE;
+        InitConfig.DisableSendSegmentation = DisableSendSegmentation;
         InitStatus =
             CxPlatDataPathInitialize(
                 ClientRecvContextLength,
@@ -819,6 +821,48 @@ TEST_P(DataPathTest, EnumerateSendDatagramsValidatesBeforeCallback)
     EXPECT_EQ(std::vector<uint8_t>(Full[1].begin(), Full[1].end()), Enumeration.Datagrams[1]);
     EXPECT_EQ(std::vector<uint8_t>(Short.begin(), Short.end()), Enumeration.Datagrams[2]);
 
+    CxPlatSendDataFree(SendData);
+}
+
+TEST_P(DataPathTest, EnumerateNonGsoMultiBufferSendDatagrams)
+{
+    CxPlatDataPath Datapath(
+        &EmptyUdpCallbacks, nullptr, 0, nullptr, true);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+    EXPECT_FALSE(
+        Datapath.IsSupported(CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION));
+
+    auto RemoteAddress = GetNewLocalAddr();
+    RemoteAddress.SetPort(GetNextPort());
+    CxPlatSocket Socket(Datapath, nullptr, &RemoteAddress.SockAddr, nullptr);
+    VERIFY_QUIC_SUCCESS(Socket.GetInitStatus());
+
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &Socket.Route, 0, CXPLAT_ECN_NON_ECT, 0, CXPLAT_DSCP_CS0};
+    CXPLAT_SEND_DATA* SendData = CxPlatSendDataAlloc(Socket, &SendConfig);
+    ASSERT_NE(nullptr, SendData);
+    const std::array<std::vector<uint8_t>, 3> Datagrams = {{
+        {0, 1, 2},
+        {3, 4, 5, 6, 7},
+        {8, 9}}};
+    for (const auto& Bytes : Datagrams) {
+        QUIC_BUFFER* Buffer =
+            CxPlatSendDataAllocBuffer(SendData, (uint16_t)Bytes.size());
+        ASSERT_NE(nullptr, Buffer);
+        CxPlatCopyMemory(Buffer->Buffer, Bytes.data(), Bytes.size());
+    }
+
+    DatagramEnumerationContext Enumeration;
+    EXPECT_EQ(
+        QUIC_STATUS_SUCCESS,
+        CxPlatSendDataEnumerateDatagrams(
+            SendData, 3, 10, RecordEnumeratedDatagram, &Enumeration));
+    EXPECT_EQ(3u, Enumeration.Count);
+    EXPECT_EQ(10u, Enumeration.Bytes);
+    ASSERT_EQ(Datagrams.size(), Enumeration.Datagrams.size());
+    for (size_t i = 0; i < Datagrams.size(); ++i) {
+        EXPECT_EQ(Datagrams[i], Enumeration.Datagrams[i]);
+    }
     CxPlatSendDataFree(SendData);
 }
 

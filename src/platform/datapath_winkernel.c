@@ -864,6 +864,9 @@ DataPathInitialize(
 
     CxPlatDataPathQueryRssScalabilityInfo(Datapath);
     CxPlatDataPathQuerySockoptSupport(Datapath, InitConfig);
+    if (InitConfig->DisableSendSegmentation) {
+        Datapath->Features &= ~CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION;
+    }
 
     *NewDataPath = Datapath;
 

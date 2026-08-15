@@ -450,6 +450,9 @@ DataPathInitialize(
     Datapath->Features = CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING;
     CxPlatRefInitializeEx(&Datapath->RefCount, Datapath->PartitionCount);
     CxPlatDataPathCalculateFeatureSupport(Datapath);
+    if (InitConfig->DisableSendSegmentation) {
+        Datapath->Features &= ~CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION;
+    }
 
     if (Datapath->Features & CXPLAT_DATAPATH_FEATURE_SEND_SEGMENTATION) {
         Datapath->SendDataSize = sizeof(CXPLAT_SEND_DATA);

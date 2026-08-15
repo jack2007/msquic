@@ -307,6 +307,14 @@ typedef struct QUIC_BINDING {
     struct {
 
         struct {
+            //
+            // ICE extension transmit failures are updated concurrently by
+            // connection partitions.
+            //
+            uint64_t ExtensionDrop;
+        } Send;
+
+        struct {
             uint64_t DroppedPackets;
             //
             // ICE extension receive dispositions. These fields are updated
@@ -568,7 +576,7 @@ QuicBindingSend(
     _In_ uint32_t DatagramsToSend
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 QuicBindingIceSelectedPathIsReady(
     _In_ QUIC_BINDING* Binding

@@ -402,6 +402,18 @@ MsQuicConnectionStart(
         goto Error;
     }
 
+    //
+    // ICE path selection is an explicit prerequisite for queueing Start. The
+    // worker repeats this acquire check to close the selection/queue race.
+    //
+    if (Connection->IceDatapathConfigured &&
+        (Connection->Paths[0].Binding == NULL ||
+         !QuicBindingIceSelectedPathIsReady(
+             Connection->Paths[0].Binding))) {
+        Status = QUIC_STATUS_INVALID_STATE;
+        goto Error;
+    }
+
     if (ServerName != NULL) {
         //
         // Validate the server name length.

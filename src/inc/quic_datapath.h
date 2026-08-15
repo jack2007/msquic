@@ -488,6 +488,13 @@ typedef struct CXPLAT_DATAPATH_INIT_CONFIG {
     //
     BOOLEAN EnableDscpOnRecv;
 
+    //
+    // Forces the portable non-segmented send representation even when the
+    // platform supports UDP segmentation. Primarily used to exercise and
+    // validate the multi-buffer fallback path.
+    //
+    BOOLEAN DisableSendSegmentation;
+
     _Field_size_(XdpMapConfigCount)
     const CXPLAT_XDP_MAP_CONFIG* XdpMapConfigs;
     uint32_t XdpMapConfigCount;
