@@ -1389,7 +1389,10 @@ CxPlatSocketCreateUdp(
     )
 {
     QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
-    BOOLEAN IsServerSocket = Config->RemoteAddress == NULL;
+    const BOOLEAN IsUnconnectedClient =
+        !!(Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+    const BOOLEAN IsServerSocket =
+        Config->RemoteAddress == NULL && !IsUnconnectedClient;
 
     CXPLAT_DBG_ASSERT(Datapath->UdpHandlers.Receive != NULL || Config->Flags & CXPLAT_SOCKET_FLAG_PCP);
 
@@ -1421,6 +1424,7 @@ CxPlatSocketCreateUdp(
     CxPlatZeroMemory(Binding, BindingLength);
     Binding->Datapath = Datapath;
     Binding->ClientContext = Config->CallbackContext;
+    Binding->NumPerProcessorSockets = IsServerSocket && Datapath->PartitionCount > 1;
     Binding->HasFixedRemoteAddress = (Config->RemoteAddress != NULL);
     Binding->Mtu = CXPLAT_MAX_MTU;
     CxPlatRefInitializeEx(&Binding->RefCount, SocketCount);
@@ -1544,11 +1548,32 @@ CxPlatSocketDelete(
 #endif
 
     const uint32_t SocketCount =
-        Socket->HasFixedRemoteAddress ? 1 : Socket->Datapath->PartitionCount;
+        Socket->NumPerProcessorSockets ? Socket->Datapath->PartitionCount : 1;
 
     for (uint32_t i = 0; i < SocketCount; ++i) {
         CxPlatSocketContextUninitialize(&Socket->SocketContexts[i]);
     }
+}
+
+uint16_t
+CxPlatSocketGetTestNativeSocketCount(
+    _In_ CXPLAT_SOCKET* Socket
+    )
+{
+    return Socket->NumPerProcessorSockets ? Socket->Datapath->PartitionCount : 1;
+}
+
+int32_t
+CxPlatSocketGetTestPeerNameError(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Out_ QUIC_ADDR* PeerAddress
+    )
+{
+    socklen_t PeerAddressLength = sizeof(*PeerAddress);
+    return getpeername(
+               Socket->SocketContexts[0].SocketFd,
+               (struct sockaddr*)PeerAddress,
+               &PeerAddressLength) == 0 ? 0 : errno;
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)

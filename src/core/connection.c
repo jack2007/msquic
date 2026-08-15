@@ -1822,7 +1822,8 @@ QuicConnStart(
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    CXPLAT_TEL_ASSERT(Path->Binding == NULL);
+    CXPLAT_TEL_ASSERT(
+        Path->Binding == NULL || Connection->IceDatapathConfigured);
 
     QuicConnApplyNewSettings(
         Connection,
@@ -1890,54 +1891,58 @@ QuicConnStart(
         Connection,
         CASTED_CLOG_BYTEARRAY(sizeof(Path->Route.RemoteAddress), &Path->Route.RemoteAddress));
 
-    CXPLAT_UDP_CONFIG UdpConfig = {0};
-    UdpConfig.LocalAddress = Connection->State.LocalAddressSet ? &Path->Route.LocalAddress : NULL;
-    UdpConfig.RemoteAddress = &Path->Route.RemoteAddress;
-    UdpConfig.Flags = CXPLAT_SOCKET_FLAG_NONE;
-    UdpConfig.InterfaceIndex = Connection->State.LocalInterfaceSet ? (uint32_t)Path->Route.LocalAddress.Ipv6.sin6_scope_id : 0; // NOLINT(google-readability-casting)
-    UdpConfig.PartitionIndex = QuicPartitionIdGetIndex(Connection->PartitionID);
+    if (Path->Binding == NULL) {
+        CXPLAT_UDP_CONFIG UdpConfig = {0};
+        UdpConfig.LocalAddress = Connection->State.LocalAddressSet ? &Path->Route.LocalAddress : NULL;
+        UdpConfig.RemoteAddress = &Path->Route.RemoteAddress;
+        UdpConfig.Flags = CXPLAT_SOCKET_FLAG_NONE;
+        UdpConfig.InterfaceIndex = Connection->State.LocalInterfaceSet ? (uint32_t)Path->Route.LocalAddress.Ipv6.sin6_scope_id : 0; // NOLINT(google-readability-casting)
+        UdpConfig.PartitionIndex = QuicPartitionIdGetIndex(Connection->PartitionID);
 #ifdef QUIC_COMPARTMENT_ID
-    UdpConfig.CompartmentId = Configuration->CompartmentId;
+        UdpConfig.CompartmentId = Configuration->CompartmentId;
 #endif
 #ifdef QUIC_OWNING_PROCESS
-    UdpConfig.OwningProcess = Configuration->OwningProcess;
+        UdpConfig.OwningProcess = Configuration->OwningProcess;
 #endif
 
-    if (Connection->State.ShareBinding) {
-        UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_SHARE;
-    }
-    if (Connection->Settings.XdpEnabled) {
-        UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_XDP;
-    }
-    if (Connection->Settings.QTIPEnabled) {
-        UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_QTIP;
-    }
-    if (Connection->State.Partitioned) {
-        UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_PARTITIONED;
-    }
+        if (Connection->State.ShareBinding) {
+            UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_SHARE;
+        }
+        if (Connection->Settings.XdpEnabled) {
+            UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_XDP;
+        }
+        if (Connection->Settings.QTIPEnabled) {
+            UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_QTIP;
+        }
+        if (Connection->State.Partitioned) {
+            UdpConfig.Flags |= CXPLAT_SOCKET_FLAG_PARTITIONED;
+        }
 
-    //
-    // Get the binding for the current local & remote addresses.
-    //
-    Status =
-        QuicLibraryGetBinding(
-            &UdpConfig,
-            &Path->Binding);
-    if (QUIC_FAILED(Status)) {
-        goto Exit;
-    }
-    IceBinding = Path->Binding;
+        //
+        // Get the binding for the current local & remote addresses.
+        //
+        Status =
+            QuicLibraryGetBinding(
+                &UdpConfig,
+                &Path->Binding);
+        if (QUIC_FAILED(Status)) {
+            goto Exit;
+        }
+        IceBinding = Path->Binding;
 
-    Status =
-        QuicBindingReserveIceExtension(
-            IceBinding,
-            Connection->IceDatapathConfigured ?
-                &Connection->IceDatapathConfig : NULL,
-            &IceToken);
-    if (QUIC_FAILED(Status)) {
-        QuicLibraryReleaseBinding(Path->Binding);
-        Path->Binding = NULL;
-        goto Exit;
+        Status =
+            QuicBindingReserveIceExtension(
+                IceBinding,
+                Connection->IceDatapathConfigured ?
+                    &Connection->IceDatapathConfig : NULL,
+                &IceToken);
+        if (QUIC_FAILED(Status)) {
+            QuicLibraryReleaseBinding(Path->Binding);
+            Path->Binding = NULL;
+            goto Exit;
+        }
+    } else {
+        IceBinding = Path->Binding;
     }
 
     //
@@ -6429,15 +6434,78 @@ QuicConnParamSet(
         }
 
         if (Connection->State.Started || Connection->State.ClosedLocally ||
-            Connection->State.ShareBinding) {
+            Connection->State.ShareBinding ||
+            Connection->IceDatapathConfigured ||
+            Connection->Paths[0].Binding != NULL) {
             Status = QUIC_STATUS_INVALID_STATE;
             break;
         }
 
+        CXPLAT_UDP_CONFIG IceUdpConfig = {0};
+        IceUdpConfig.LocalAddress =
+            Connection->State.LocalAddressSet ?
+                &Connection->Paths[0].Route.LocalAddress : NULL;
+        IceUdpConfig.RemoteAddress = NULL;
+        IceUdpConfig.Flags =
+            CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT |
+            CXPLAT_SOCKET_FLAG_PARTITIONED;
+        IceUdpConfig.InterfaceIndex =
+            Connection->State.LocalInterfaceSet ?
+                (uint32_t)Connection->Paths[0].Route.LocalAddress.Ipv6.sin6_scope_id : 0;
+        IceUdpConfig.PartitionIndex =
+            QuicPartitionIdGetIndex(Connection->PartitionID);
+#ifdef QUIC_COMPARTMENT_ID
+        IceUdpConfig.CompartmentId = QuicCompartmentIdGetCurrent();
+#endif
+        // Prepared ICE bindings intentionally use only the native UDP
+        // datapath. Raw/XDP and QTIP do not implement unconnected-client
+        // semantics in this task.
+
+        QUIC_BINDING* PreparedBinding = NULL;
+        Status = QuicLibraryGetBinding(&IceUdpConfig, &PreparedBinding);
+        if (QUIC_FAILED(Status)) {
+            break;
+        }
+
+        QUIC_ICE_INSTALL_TOKEN PrepareToken = {0};
+        Status =
+            QuicBindingReserveIceExtension(
+                PreparedBinding,
+                (const QUIC_ICE_DATAPATH_CONFIG_V1*)Buffer,
+                &PrepareToken);
+        if (QUIC_FAILED(Status)) {
+            QuicLibraryReleaseBinding(PreparedBinding);
+            break;
+        }
+
+        const BOOLEAN LocalAddressWasSet = Connection->State.LocalAddressSet;
+        const QUIC_ADDR PreviousLocalAddress =
+            Connection->Paths[0].Route.LocalAddress;
+        Connection->Paths[0].Binding = PreparedBinding;
+        QuicBindingGetLocalAddress(
+            PreparedBinding,
+            &Connection->Paths[0].Route.LocalAddress);
+        Connection->Paths[0].Route.State = RouteUnresolved;
+        Connection->Paths[0].Route.Queue = NULL;
+        Connection->State.LocalAddressSet = TRUE;
         Connection->IceDatapathConfig =
             *(const QUIC_ICE_DATAPATH_CONFIG_V1*)Buffer;
         Connection->IceDatapathConfigured = TRUE;
-        Status = QUIC_STATUS_SUCCESS;
+
+        Status =
+            QuicBindingCommitIceExtension(
+                PreparedBinding,
+                &PrepareToken);
+        if (QUIC_FAILED(Status)) {
+            Connection->IceDatapathConfigured = FALSE;
+            CxPlatZeroMemory(
+                &Connection->IceDatapathConfig,
+                sizeof(Connection->IceDatapathConfig));
+            Connection->State.LocalAddressSet = LocalAddressWasSet;
+            Connection->Paths[0].Route.LocalAddress = PreviousLocalAddress;
+            Connection->Paths[0].Binding = NULL;
+            QuicLibraryReleaseBinding(PreparedBinding);
+        }
         break;
 
     case QUIC_PARAM_CONN_LOCAL_ADDRESS: {
@@ -6447,7 +6515,8 @@ QuicConnParamSet(
             break;
         }
 
-        if (Connection->State.ClosedLocally || QuicConnIsServer(Connection)) {
+        if (Connection->State.ClosedLocally || QuicConnIsServer(Connection) ||
+            Connection->IceDatapathConfigured) {
             Status = QUIC_STATUS_INVALID_STATE;
             break;
         }
@@ -7243,6 +7312,32 @@ QuicConnParamGet(
     uint8_t Type;
 
     switch (Param) {
+
+    case QUIC_PARAM_CONN_ICE_BOUND_ADDRESS:
+
+        if (*BufferLength < sizeof(QUIC_ADDR)) {
+            *BufferLength = sizeof(QUIC_ADDR);
+            Status = QUIC_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        if (Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (!Connection->IceDatapathConfigured ||
+            Connection->Paths[0].Binding == NULL) {
+            Status = QUIC_STATUS_INVALID_STATE;
+            break;
+        }
+
+        *BufferLength = sizeof(QUIC_ADDR);
+        QuicBindingGetLocalAddress(
+            Connection->Paths[0].Binding,
+            (QUIC_ADDR*)Buffer);
+        Status = QUIC_STATUS_SUCCESS;
+        break;
 
     case QUIC_PARAM_CONN_QUIC_VERSION:
 

@@ -23,6 +23,19 @@ Abstract:
 
 extern bool UseDuoNic;
 
+extern "C" {
+uint16_t
+CxPlatSocketGetTestNativeSocketCount(
+    _In_ CXPLAT_SOCKET* Socket
+    );
+
+int32_t
+CxPlatSocketGetTestPeerNameError(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Out_ QUIC_ADDR* PeerAddress
+    );
+}
+
 //
 // Connect to the duonic address (if using duonic) or localhost (if not).
 //
@@ -1098,6 +1111,86 @@ TEST_P(DataPathTest, UdpShareClientSocket)
     Client2.Send(ClientSendData);
     ASSERT_TRUE(CxPlatEventWaitWithTimeout(RecvContext.ClientCompletion, 2000));
     CxPlatEventReset(RecvContext.ClientCompletion);
+}
+
+TEST_P(DataPathTest, UdpUnconnectedClientSocket)
+{
+    if (UseDuoNic || CxPlatProcCount() < 2) {
+        GTEST_SKIP_NO_RETURN_("Requires two native processors without XDP");
+        return;
+    }
+
+    alignas(QUIC_GLOBAL_EXECUTION_CONFIG)
+        uint8_t ConfigBuffer[
+            QUIC_GLOBAL_EXECUTION_CONFIG_MIN_SIZE + 2 * sizeof(uint16_t)] = {0};
+    auto* ExecutionConfig =
+        reinterpret_cast<QUIC_GLOBAL_EXECUTION_CONFIG*>(ConfigBuffer);
+    ExecutionConfig->Flags = QUIC_GLOBAL_EXECUTION_CONFIG_FLAG_NONE;
+    ExecutionConfig->ProcessorCount = 2;
+    ExecutionConfig->ProcessorList[0] = 0;
+    ExecutionConfig->ProcessorList[1] = 1;
+
+    UdpRecvContext RecvContext;
+    CxPlatDataPath Datapath(
+        &UdpRecvCallbacks,
+        nullptr,
+        0,
+        ExecutionConfig);
+    VERIFY_QUIC_SUCCESS(Datapath.GetInitStatus());
+    RecvContext.TtlSupported =
+        Datapath.IsSupported(CXPLAT_DATAPATH_FEATURE_TTL);
+    RecvContext.DscpSupported = Datapath.IsDscpSupported();
+
+    auto LocalAddress = GetNewUnspecAddr(false);
+    CxPlatSocket Client(
+        Datapath,
+        &LocalAddress.SockAddr,
+        nullptr,
+        &RecvContext,
+        CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+    VERIFY_QUIC_SUCCESS(Client.GetInitStatus());
+    ASSERT_NE(nullptr, Client.Socket);
+    const QUIC_ADDR BoundAddress = Client.GetLocalAddress();
+    EXPECT_NE(0, QuicAddrGetPort(&BoundAddress));
+    EXPECT_EQ(1, CxPlatSocketGetTestNativeSocketCount(Client.Socket));
+
+    QUIC_ADDR PeerAddress = {0};
+    const int32_t PeerNameError =
+        CxPlatSocketGetTestPeerNameError(Client.Socket, &PeerAddress);
+#ifdef _WIN32
+    EXPECT_EQ(WSAENOTCONN, PeerNameError);
+#else
+    EXPECT_EQ(ENOTCONN, PeerNameError);
+#endif
+
+    auto ServerLocalAddress = GetNewUnspecAddr(false);
+    CxPlatSocket Server(
+        Datapath,
+        &ServerLocalAddress.SockAddr,
+        nullptr,
+        &RecvContext);
+    VERIFY_QUIC_SUCCESS(Server.GetInitStatus());
+
+    RecvContext.DestinationAddress = GetNewLocalAddr(false).SockAddr;
+    const QUIC_ADDR ServerBoundAddress = Server.GetLocalAddress();
+    QuicAddrSetPort(
+        &RecvContext.DestinationAddress,
+        QuicAddrGetPort(&ServerBoundAddress));
+    CXPLAT_ROUTE SendRoute = Client.Route;
+    SendRoute.RemoteAddress = RecvContext.DestinationAddress;
+    CXPLAT_SEND_CONFIG SendConfig = {
+        &SendRoute,
+        0,
+        CXPLAT_ECN_NON_ECT,
+        0,
+        CXPLAT_DSCP_CS0 };
+    auto SendData = CxPlatSendDataAlloc(Client, &SendConfig);
+    ASSERT_NE(nullptr, SendData);
+    auto SendBuffer = CxPlatSendDataAllocBuffer(SendData, ExpectedDataSize);
+    ASSERT_NE(nullptr, SendBuffer);
+    memcpy(SendBuffer->Buffer, ExpectedData, ExpectedDataSize);
+    Client.Send(SendRoute, SendData);
+    EXPECT_TRUE(CxPlatEventWaitWithTimeout(RecvContext.ClientCompletion, 2000));
 }
 
 TEST_P(DataPathTest, MultiBindListener) {

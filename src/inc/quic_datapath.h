@@ -448,6 +448,7 @@ typedef enum CXPLAT_SOCKET_FLAGS {
     CXPLAT_SOCKET_FLAG_XDP          = 0x00000008, // Socket will use XDP
     CXPLAT_SOCKET_FLAG_QTIP         = 0x00000010, // Socket will use QTIP
     CXPLAT_SOCKET_FLAG_PARTITIONED  = 0x00000020, // Socket is partitioned
+    CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT = 0x00000040, // Client socket without an OS connect
 } CXPLAT_SOCKET_FLAGS;
 
 DEFINE_ENUM_FLAG_OPERATORS(CXPLAT_SOCKET_FLAGS)
@@ -615,7 +616,8 @@ CxPlatDataPathGetGatewayAddresses(
 //
 // When using CXPLAT_UDP_CONFIG, keep in mind the assumptions made by MsQuic core/datapath code about the config:
 //      - A server listener MUST specify a NULL remote address AND a wildcard local address.
-//      - A client connection MUST specify a non-NULL remote address.
+//      - A client connection MUST specify a non-NULL remote address unless it sets
+//        CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT.
 //      - A remote address MUST NOT be a wildcard address.
 //      - A client connection can specify anything for the local address: NULL, wildcard, any <ip/port tupple>.
 //        If NULL, the datapath will assume an IPv6 socket local address.

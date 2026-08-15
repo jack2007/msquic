@@ -1220,7 +1220,10 @@ SocketCreateUdp(
     )
 {
     QUIC_STATUS Status;
-    const BOOLEAN IsServerSocket = Config->RemoteAddress == NULL;
+    const BOOLEAN IsUnconnectedClient =
+        !!(Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+    const BOOLEAN IsServerSocket =
+        Config->RemoteAddress == NULL && !IsUnconnectedClient;
     const BOOLEAN NumPerProcessorSockets = IsServerSocket && Datapath->PartitionCount > 1;
     const uint16_t SocketCount = NumPerProcessorSockets ? (uint16_t)CxPlatProcCount() : 1;
     INET_PORT_RESERVATION_INSTANCE PortReservation;
@@ -1372,7 +1375,7 @@ SocketCreateUdp(
 
         CXPLAT_SOCKET_PROC* SocketProc = &Socket->PerProcSockets[i];
         const uint16_t PartitionIndex =
-            Config->RemoteAddress ?
+            !IsServerSocket ?
                 Config->PartitionIndex :
                 i % Datapath->PartitionCount;
         DWORD SocketFlags = WSA_FLAG_OVERLAPPED;
@@ -1418,7 +1421,7 @@ SocketCreateUdp(
             goto Error;
         }
 
-        if (Config->RemoteAddress == NULL && Datapath->PartitionCount > 1) {
+        if (IsServerSocket && Datapath->PartitionCount > 1) {
             uint16_t Processor = i; // API only supports 16-bit proc index.
             Result =
                 WSAIoctl(
@@ -2453,6 +2456,27 @@ void
 CxPlatSocketRelease(
     _In_ CXPLAT_SOCKET* Socket
     );
+
+uint16_t
+CxPlatSocketGetTestNativeSocketCount(
+    _In_ CXPLAT_SOCKET* Socket
+    )
+{
+    return Socket->NumPerProcessorSockets ? (uint16_t)CxPlatProcCount() : 1;
+}
+
+int32_t
+CxPlatSocketGetTestPeerNameError(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Out_ QUIC_ADDR* PeerAddress
+    )
+{
+    int PeerAddressLength = sizeof(*PeerAddress);
+    return getpeername(
+               Socket->PerProcSockets[0].Socket,
+               (struct sockaddr*)PeerAddress,
+               &PeerAddressLength) == 0 ? 0 : WSAGetLastError();
+}
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 void

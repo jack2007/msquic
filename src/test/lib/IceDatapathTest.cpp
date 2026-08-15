@@ -491,3 +491,157 @@ TEST(IceDatapath, BlockingBoundMakesConcurrentCompatibleStartFailFast)
     EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
     EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
 }
+
+TEST(IceDatapath, PreparedUnconnectedClient)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+
+    QuicAddr RequestedLocal(QUIC_ADDRESS_FAMILY_INET, true);
+    RequestedLocal.SetPort(0);
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Connection.SetLocalAddr(RequestedLocal));
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(0u, Context.UnboundCount.load(std::memory_order_relaxed));
+
+    QUIC_ADDR PreparedAddress = {0};
+    uint32_t PreparedAddressLength = sizeof(PreparedAddress);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.GetParam(
+            QUIC_PARAM_CONN_ICE_BOUND_ADDRESS,
+            &PreparedAddressLength,
+            &PreparedAddress));
+    ASSERT_EQ(sizeof(PreparedAddress), PreparedAddressLength);
+    ASSERT_NE(0, QuicAddrGetPort(&PreparedAddress));
+    EXPECT_EQ(QUIC_ADDRESS_FAMILY_INET, QuicAddrGetFamily(&PreparedAddress));
+
+    QuicAddr DifferentLocal(QUIC_ADDRESS_FAMILY_INET, true);
+    DifferentLocal.SetPort(0);
+    EXPECT_EQ(
+        QUIC_STATUS_INVALID_STATE,
+        Connection.SetLocalAddr(DifferentLocal));
+
+    MsQuicAlpn Alpn("PreparedUnconnectedClient");
+    MsQuicCredentialConfig ClientCredConfig;
+    MsQuicConfiguration ClientConfiguration(
+        Registration, Alpn, ClientCredConfig);
+    ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_TRUE(
+        QUIC_SUCCEEDED(Connection.Start(
+            ClientConfiguration,
+            QUIC_ADDRESS_FAMILY_INET,
+            "127.0.0.1",
+            9)));
+
+    QUIC_ADDR StartedAddress = {0};
+    uint32_t StartedAddressLength = sizeof(StartedAddress);
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.GetParam(
+            QUIC_PARAM_CONN_ICE_BOUND_ADDRESS,
+            &StartedAddressLength,
+            &StartedAddress));
+    EXPECT_TRUE(QuicAddrCompare(&PreparedAddress, &StartedAddress));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+
+    Connection.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, PreparedUnconnectedClientCloseWithoutStart)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+
+    Connection.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}
+
+TEST(IceDatapath, PreparedBindingFailureRollsBack)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+#ifdef _WIN32
+    SOCKET PortOwner = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_NE(INVALID_SOCKET, PortOwner);
+#else
+    int PortOwner = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_GE(PortOwner, 0);
+#endif
+    sockaddr_in NativeAddress = {0};
+    NativeAddress.sin_family = AF_INET;
+    NativeAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(
+        0,
+        bind(
+            PortOwner,
+            reinterpret_cast<const sockaddr*>(&NativeAddress),
+            sizeof(NativeAddress)));
+#ifdef _WIN32
+    int NativeAddressLength = sizeof(NativeAddress);
+#else
+    socklen_t NativeAddressLength = sizeof(NativeAddress);
+#endif
+    ASSERT_EQ(
+        0,
+        getsockname(
+            PortOwner,
+            reinterpret_cast<sockaddr*>(&NativeAddress),
+            &NativeAddressLength));
+
+    QuicAddr OccupiedLocal;
+    CxPlatCopyMemory(
+        &OccupiedLocal.SockAddr.Ipv4,
+        &NativeAddress,
+        sizeof(NativeAddress));
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Connection.SetLocalAddr(OccupiedLocal));
+    EXPECT_EQ(
+        QUIC_STATUS_ADDRESS_IN_USE,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    EXPECT_EQ(0u, Context.BoundCount.load(std::memory_order_relaxed));
+
+#ifdef _WIN32
+    closesocket(PortOwner);
+#else
+    close(PortOwner);
+#endif
+
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+    EXPECT_EQ(1u, Context.BoundCount.load(std::memory_order_relaxed));
+
+    Connection.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+    EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
+}

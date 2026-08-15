@@ -900,7 +900,10 @@ CxPlatSocketContextInitialize(
         // Only set SO_REUSEPORT on a server socket, otherwise the client could be
         // assigned a server port (unless it's forcing sharing).
         //
-        if ((Config->Flags & CXPLAT_SOCKET_FLAG_SHARE || Config->RemoteAddress == NULL) &&
+        const BOOLEAN IsServerSocket =
+            Config->RemoteAddress == NULL &&
+            !(Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+        if ((Config->Flags & CXPLAT_SOCKET_FLAG_SHARE || IsServerSocket) &&
             SocketContext->Binding->Datapath->PartitionCount > 1) {
             //
             // The port is shared across processors.
@@ -1258,7 +1261,10 @@ SocketCreateUdp(
     )
 {
     QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
-    const BOOLEAN IsServerSocket = Config->RemoteAddress == NULL;
+    const BOOLEAN IsUnconnectedClient =
+        !!(Config->Flags & CXPLAT_SOCKET_FLAG_UNCONNECTED_CLIENT);
+    const BOOLEAN IsServerSocket =
+        Config->RemoteAddress == NULL && !IsUnconnectedClient;
     const BOOLEAN NumPerProcessorSockets = IsServerSocket && Datapath->PartitionCount > 1;
     const uint16_t SocketCount = NumPerProcessorSockets ? (uint16_t)CxPlatProcCount() : 1;
 
@@ -1315,7 +1321,7 @@ SocketCreateUdp(
             CxPlatSocketContextInitialize(
                 &Binding->SocketContexts[i],
                 Config,
-                Config->RemoteAddress ? Config->PartitionIndex : (i % Datapath->PartitionCount),
+                !IsServerSocket ? Config->PartitionIndex : (i % Datapath->PartitionCount),
                 Binding->Type);
         if (QUIC_FAILED(Status)) {
             goto Exit;
@@ -1399,6 +1405,27 @@ SocketCreateTcpListener(
     UNREFERENCED_PARAMETER(CallbackContext);
     UNREFERENCED_PARAMETER(Socket);
     return QUIC_STATUS_NOT_SUPPORTED;
+}
+
+uint16_t
+CxPlatSocketGetTestNativeSocketCount(
+    _In_ CXPLAT_SOCKET* Socket
+    )
+{
+    return Socket->NumPerProcessorSockets ? (uint16_t)CxPlatProcCount() : 1;
+}
+
+int32_t
+CxPlatSocketGetTestPeerNameError(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Out_ QUIC_ADDR* PeerAddress
+    )
+{
+    socklen_t PeerAddressLength = sizeof(*PeerAddress);
+    return getpeername(
+               Socket->SocketContexts[0].SocketFd,
+               (struct sockaddr*)PeerAddress,
+               &PeerAddressLength) == 0 ? 0 : errno;
 }
 
 void

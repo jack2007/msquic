@@ -26,6 +26,27 @@
 // Must be included after msquic.h for QUIC_CERTIFICATE_FLAGS
 #include "quic_cert.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define CXPLAT_TEST_ONLY_HIDDEN __attribute__((visibility("hidden")))
+#else
+#define CXPLAT_TEST_ONLY_HIDDEN
+#endif
+
+CXPLAT_TEST_ONLY_HIDDEN
+uint16_t
+CxPlatSocketGetTestNativeSocketCount(
+    _In_ CXPLAT_SOCKET* Socket
+    );
+
+CXPLAT_TEST_ONLY_HIDDEN
+int32_t
+CxPlatSocketGetTestPeerNameError(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Out_ QUIC_ADDR* PeerAddress
+    );
+
+#undef CXPLAT_TEST_ONLY_HIDDEN
+
 #ifdef QUIC_FUZZER
 #include "msquic_fuzz.h"
 
