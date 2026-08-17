@@ -1851,6 +1851,14 @@ QuicConnStart(
         FALSE,
         &Configuration->Settings);
 
+    // ICE nomination publishes the selected pair via QUIC_PARAM_CONN_REMOTE_ADDRESS
+    // before ConnectionStart. ServerName/ServerPort remain TLS SNI only and must
+    // not replace the nominated IP or NAT-mapped port (prflx often differs from
+    // the proto listen port).
+    const BOOLEAN IceKeepNominatedRemote =
+        Connection->IceDatapathConfigured &&
+        Connection->State.RemoteAddressSet;
+
     if (!Connection->State.RemoteAddressSet) {
 
         CXPLAT_DBG_ASSERT(ServerName != NULL);
@@ -1905,7 +1913,9 @@ QuicConnStart(
         goto Exit;
     }
 
-    QuicAddrSetPort(&Path->Route.RemoteAddress, ServerPort);
+    if (!IceKeepNominatedRemote) {
+        QuicAddrSetPort(&Path->Route.RemoteAddress, ServerPort);
+    }
     QuicTraceEvent(
         ConnRemoteAddrAdded,
         "[conn][%p] New Remote IP: %!ADDR!",
@@ -5795,7 +5805,12 @@ QuicConnRecvDatagrams(
 
         QUIC_PATH* DatagramPath = QuicConnGetPathForPacket(Connection, Packet);
         if (DatagramPath == NULL) {
-            QuicPacketLogDrop(Connection, Packet, "Max paths already tracked");
+            QuicPacketLogDrop(
+                Connection,
+                Packet,
+                Connection->State.HandshakeConfirmed ?
+                    "Max paths already tracked" :
+                    "Unexpected path before handshake confirmed");
             goto Drop;
         }
 

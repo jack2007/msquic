@@ -240,12 +240,29 @@ QuicConnGetPathForPacket(
     )
 {
     for (uint8_t i = 0; i < Connection->PathsCount; ++i) {
-        if (!QuicAddrCompare(
-                &Packet->Route->LocalAddress,
-                &Connection->Paths[i].Route.LocalAddress) ||
-            !QuicAddrCompare(
+        const QUIC_PATH* Path = &Connection->Paths[i];
+        const BOOLEAN RemoteMatch =
+            QuicAddrCompare(
                 &Packet->Route->RemoteAddress,
-                &Connection->Paths[i].Route.RemoteAddress)) {
+                &Path->Route.RemoteAddress);
+        const BOOLEAN LocalExactMatch =
+            QuicAddrCompare(
+                &Packet->Route->LocalAddress,
+                &Path->Route.LocalAddress);
+        //
+        // ICE unconnected client sockets bind a wildcard local address. The
+        // datapath reports the concrete destination NIC on receive, so an
+        // exact compare would drop every handshake packet.
+        //
+        const BOOLEAN LocalIceWildcardMatch =
+            !LocalExactMatch &&
+            Connection->IceDatapathConfigured &&
+            QuicAddrIsWildCard(&Path->Route.LocalAddress) &&
+            QuicAddrGetFamily(&Path->Route.LocalAddress) ==
+                QuicAddrGetFamily(&Packet->Route->LocalAddress) &&
+            QuicAddrGetPort(&Path->Route.LocalAddress) ==
+                QuicAddrGetPort(&Packet->Route->LocalAddress);
+        if (!RemoteMatch || (!LocalExactMatch && !LocalIceWildcardMatch)) {
             if (!Connection->State.HandshakeConfirmed) {
                 //
                 // Ignore packets on any other paths until connected/confirmed.

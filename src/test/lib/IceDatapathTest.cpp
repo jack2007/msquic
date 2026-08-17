@@ -2378,6 +2378,52 @@ TEST(IceDatapath, PreparedUnconnectedClient)
     EXPECT_EQ(1u, Context.UnboundCount.load(std::memory_order_relaxed));
 }
 
+TEST(IceDatapath, PreparedUnconnectedClientKeepsNominatedRemotePort)
+{
+    MsQuicRegistration Registration(true);
+    ASSERT_TRUE(Registration.IsValid());
+
+    IceCallbackContext Context;
+    auto Config = MakeIceConfig(&Context);
+    MsQuicConnection Connection(Registration);
+    ASSERT_TRUE(Connection.IsValid());
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Connection.SetParam(
+            QUIC_PARAM_CONN_ICE_DATAPATH_CONFIG, sizeof(Config), &Config));
+
+    QuicAddr NominatedRemote(QUIC_ADDRESS_FAMILY_INET, true);
+    NominatedRemote.SockAddr.Ipv4.sin_addr.s_addr = htonl(0x7f000001);
+    NominatedRemote.SetPort(57842);
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Connection.SetRemoteAddr(NominatedRemote));
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        Context.Binding.SetSelectedPath(
+            Context.Binding.BindingContext, QUIC_ICE_PATH_DIRECT));
+
+    MsQuicAlpn Alpn("PreparedKeepsNominatedRemote");
+    MsQuicCredentialConfig ClientCredConfig;
+    MsQuicConfiguration ClientConfiguration(
+        Registration, Alpn, ClientCredConfig);
+    ASSERT_TRUE(ClientConfiguration.IsValid());
+    ASSERT_TRUE(
+        QUIC_SUCCEEDED(Connection.Start(
+            ClientConfiguration,
+            QUIC_ADDRESS_FAMILY_INET,
+            "127.0.0.1",
+            57839)));
+
+    QuicAddr StartedRemote;
+    ASSERT_EQ(QUIC_STATUS_SUCCESS, Connection.GetRemoteAddr(StartedRemote));
+    EXPECT_EQ(57842, StartedRemote.GetPort());
+    EXPECT_EQ(
+        NominatedRemote.SockAddr.Ipv4.sin_addr.s_addr,
+        StartedRemote.SockAddr.Ipv4.sin_addr.s_addr);
+
+    Connection.Close();
+    ASSERT_TRUE(Context.UnboundEvent.WaitTimeout(2000));
+}
+
 TEST(IceDatapath, PreparedUnconnectedClientCloseWithoutStart)
 {
     MsQuicRegistration Registration(true);
