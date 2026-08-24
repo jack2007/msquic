@@ -757,26 +757,21 @@ QuicBindingCommitIceExtension(
         return QUIC_STATUS_INVALID_STATE;
     }
 
-    Status = QUIC_STATUS_SUCCESS;
     QUIC_ICE_DATAPATH_CONFIG_V1 Config;
-    const QUIC_ICE_BINDING_API_V1* BindingApi = NULL;
+    const QUIC_ICE_BINDING_API_V1* BindingApi;
     CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);
     if (!Binding->IceExtension.Configured ||
         !Binding->IceExtension.Installing ||
         Binding->IceExtension.Bound ||
         Binding->IceExtension.Closing) {
-        Status = QUIC_STATUS_INVALID_STATE;
-    } else {
-        Config = Binding->IceExtension.Config;
-        BindingApi = &Binding->IceExtension.BindingApi;
-    }
-    CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
-
-    if (QUIC_FAILED(Status)) {
+        CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
         QuicBindingAbortIceExtension(Binding, Token);
         QuicLibraryReleaseBinding(Binding);
-        return Status;
+        return QUIC_STATUS_INVALID_STATE;
     }
+    Config = Binding->IceExtension.Config;
+    BindingApi = &Binding->IceExtension.BindingApi;
+    CxPlatDispatchRwLockReleaseExclusive(&Binding->RwLock, PrevIrql);
 
     CXPLAT_DBG_ASSERT(Token->BindingRefHeld);
     Token->FirstInstall = FALSE;
@@ -787,7 +782,14 @@ QuicBindingCommitIceExtension(
 
     QUIC_ADDR LocalAddress;
     QuicBindingGetLocalAddress(Binding, &LocalAddress);
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4701)
+#endif
     Config.Bound(Config.Context, BindingApi, &LocalAddress);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
     CxPlatDispatchRwLockAcquireExclusive(&Binding->RwLock, PrevIrql);
     CXPLAT_DBG_ASSERT(Binding->IceExtension.Configured);
