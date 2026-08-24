@@ -259,6 +259,12 @@ typedef struct CXPLAT_SOCKET {
     BOOLEAN Connected : 1;
 
     //
+    // Flag indicates the socket has more than one socket, affinitized to all
+    // the processors.
+    //
+    BOOLEAN NumPerProcessorSockets : 1;
+
+    //
     // Flag indicates the socket has a default remote destination.
     //
     BOOLEAN HasFixedRemoteAddress : 1;
